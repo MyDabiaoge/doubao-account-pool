@@ -45,6 +45,12 @@ export function diagnoseRequest(message: string): RequestErrorInfo {
   if (/未提取到.*分享链接|未复制到分享链接|分享面板|复制.*失败|分享.*同步/.test(message)) {
     return requestError("sharing", "share_unavailable", "未取得视频分享链接", message, "已有视频可恢复结果，无需重新生成。", true);
   }
+  if (/参考图上传校验失败|参考图上传失败|参考图不存在|参考图为空|没有找到豆包页面的图片上传控件/.test(message)) {
+    return requestError("submission", "reference_upload_failed", "参考图上传失败", message, "检查参考图路径、格式和数量，并确认豆包页面可正常添加图片后重试。");
+  }
+  if (/画幅未确认|时长未确认/.test(message)) {
+    return requestError("submission", "video_settings_unconfirmed", "豆包视频设置未确认", message, "检查豆包工具栏的画幅和时长设置后重试；未确认前不会提交生成。");
+  }
   if (/没有可用账号|请求没有分配账号|账号不存在/.test(message)) return requestError("account", "account_unavailable", "暂无可用账号", message, "检查空闲账号、登录状态和豆包本地额度。");
   if (/未登录|登录失效|需要登录/.test(message)) return requestError("account", "login_required", "豆包账号需要登录", message, "打开对应账号重新登录。");
   if (/侵权|违规|无法返回该内容|换个主题/.test(message)) return requestError("generation", "content_rejected", "豆包拒绝生成内容", message, "按豆包回复调整内容后再提交。");
@@ -70,7 +76,7 @@ export function requestPhase(request: Pick<ApiRequest, "status" | "message" | "e
   if (/去水印|解析|MP4/.test(text)) return /同步|未就绪|未拿到/.test(text) ? "等待解析资源" : "去水印解析";
   if (/分享|复制/.test(text)) return "复制视频分享";
   if (/尚未确认|补发|等待启动|确认生成/.test(text)) return "等待启动确认";
-  if (/画幅|模型|填写|参考图|打开豆包/.test(text)) return "准备生成";
+  if (/画幅|时长|模型|填写|参考图|打开豆包/.test(text)) return "准备生成";
   if (/等待生成|等待视频|已提交豆包|确认视频结果/.test(text)) return "视频生成中";
   return request.status === "accepted" ? "等待处理" : "提交生成";
 }

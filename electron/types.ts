@@ -2,6 +2,8 @@ export type LoginStatus = "unknown" | "logged_in" | "logged_out";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type DoubaoAspectRatio = "9:16" | "16:9";
+/** Video duration in whole seconds, as offered by the Doubao toolbar slider. */
+export type DoubaoDurationSeconds = number;
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
 export type ExecutionPhase = "queued" | "submitting" | "generating" | "sharing" | "watermark" | "output" | "paused" | "finished";
 export type OperationLogStatus = "info" | "success" | "failed";
@@ -106,6 +108,7 @@ export interface ApiRequest {
   source: string;
   model: DoubaoModel;
   aspectRatio: DoubaoAspectRatio;
+  durationSeconds: DoubaoDurationSeconds | null;
   accountId: number | null;
   requestedAccountId: number | null;
   assignmentRevision: number;
@@ -116,6 +119,7 @@ export interface ApiRequest {
   message: string;
   prompt: string;
   referenceImagePath: string | null;
+  referenceImagePaths: string[];
   removeWatermark: boolean;
   callbackUrl: string | null;
   doubaoThreadUrl: string | null;
@@ -140,12 +144,14 @@ export interface ApiRequestCreateInput {
   source?: string;
   model: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | null;
+  durationSeconds?: DoubaoDurationSeconds | null;
   accountId?: number | null;
   requestedAccountId?: number | null;
   status: ApiRequestStatus;
   message?: string;
   prompt: string;
   referenceImagePath?: string | null;
+  referenceImagePaths?: string[] | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   quotaCost?: number;
@@ -204,9 +210,14 @@ export interface GenerateRequestBody {
   accountId?: number | string;
   model?: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | string | null;
+  durationSeconds?: number | string | null;
+  /** Alias of durationSeconds; scalar multipart fields arrive as strings. */
+  duration?: number | string | null;
   prompt: string;
   referenceImagePath?: string | null;
   referenceImageUrl?: string | null;
+  referenceImages?: string[] | string | null;
+  referenceImageUrls?: string[] | string | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   source?: string;

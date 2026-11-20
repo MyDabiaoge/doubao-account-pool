@@ -8,15 +8,37 @@ export function recoveryCandidatesForTask(preferred: string | null, candidates: 
 export function hasFormalGenerationAcknowledgement(text: string, modelLabel: string) {
   const compact = text.replace(/[\s*]+/g, "");
   const label = modelLabel.replace(/\s+/g, "");
-  return compact.includes(`本次使用${label}生成`)
+  if (!compact.includes(label)) return false;
+  const classicAcknowledgement = compact.includes(`本次使用${label}生成`)
     && /预计等待|大约需要|视频生成好后|本次生成将消耗每日免费额度/.test(compact);
+  // 补发确认指令带上版权声明后，豆包的回复不再使用“本次使用 … 生成”句式，
+  // 常见变体有“已确认参数，马上启动视频生成”和
+  // “已确认版权自担声明，按照设定开始生成 … 生成任务已提交”。
+  const copyrightAcknowledgement = /版权(?:风险|自担|声明)/.test(compact)
+    && /(?:马上|立即|即将|现在|开始|按照设定)[^。]{0,16}(?:启动|开始|提交)[^。]{0,16}(?:视频)?生成/.test(compact);
+  const taskSubmitted = /生成任务已提交|已提交(?:视频)?生成任务|视频生成已提交/.test(compact);
+  return classicAcknowledgement || copyrightAcknowledgement || taskSubmitted;
 }
 
 export function hasNewFormalGenerationAcknowledgement(current: string, baseline: string, modelLabel: string) {
+  if (!hasFormalGenerationAcknowledgement(current, modelLabel)) return false;
   const compact = (text: string) => text.replace(/[\s*]+/g, "");
-  const phrase = `本次使用${compact(modelLabel)}生成`;
-  return hasFormalGenerationAcknowledgement(current, modelLabel)
-    && compact(current).split(phrase).length > compact(baseline).split(phrase).length;
+  const label = modelLabel.replace(/\s+/g, "");
+  const markers = [
+    `本次使用${label}生成`,
+    "已确认参数",
+    "马上启动视频生成",
+    "立即启动视频生成",
+    "知悉版权风险",
+    "版权自担",
+    "按照设定开始生成",
+    "生成任务已提交",
+    "已提交生成任务",
+    "视频生成已提交"
+  ];
+  return markers.some((marker) => (
+    compact(current).split(compact(marker)).length > compact(baseline).split(compact(marker)).length
+  ));
 }
 
 export interface ConfirmationPolicyInput {

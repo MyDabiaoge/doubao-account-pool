@@ -1,9 +1,9 @@
 import http, { type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, ipcMain, powerMonitor, session } from "electron";
+import { app, BrowserWindow, ipcMain, powerMonitor, session, type Session } from "electron";
 import { DailyQuotaTimer } from "./quota-clock.js";
 import { doubaoDailyQuotaError } from "./doubao-quota-state.js";
 import log from "electron-log/main.js";
@@ -22,6 +22,15 @@ import type {
 } from "./types.js";
 import { resolveCleanVideoUrl, WatermarkError } from "./watermark.js";
 import type { WatermarkProviderObserver } from "./watermark-state.js";
+import { HttpError } from "./http-error.js";
+import { parseMultipartGenerateRequest, readBufferBody, type MultipartFilePart } from "./multipart.js";
+import { MAX_GENERATE_REQUEST_BYTES, toReferenceStringList } from "./reference-images.js";
+import { prepareReferenceImages } from "./reference-files.js";
+import {
+  DOUBAO_DURATION_MAX_SECONDS,
+  DOUBAO_DURATION_MIN_SECONDS,
+  normalizeDoubaoDurationSeconds
+} from "./generation-options.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -151,7 +160,8 @@ class LocalApiServer {
 
       if (request.method === "POST" && requestUrl.pathname === "/api/generate") {
         const requestId = `doubao-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
-        const body = await readGenerateRequest(request, requestId);
+        const parsed = await readGenerateRequest(request);
+        const body = parsed.body;
         const prompt = body.prompt?.trim();
         if (!prompt) {
           sendJson(response, 400, { error: "prompt is required" });
@@ -171,15 +181,34 @@ class LocalApiServer {
           return;
         }
 
+        const rawDuration = body.durationSeconds ?? body.duration;
+        const durationSeconds = normalizeDoubaoDurationSeconds(rawDuration);
+        const rawDurationText = rawDuration === undefined || rawDuration === null ? "" : String(rawDuration).trim();
+        if (rawDurationText && durationSeconds === null) {
+          sendJson(response, 400, {
+            error: `durationSeconds must be an integer between ${DOUBAO_DURATION_MIN_SECONDS} and ${DOUBAO_DURATION_MAX_SECONDS}`,
+            code: "invalid_duration"
+          });
+          return;
+        }
+
         const accountId = body.accountId === undefined ? undefined : Number(body.accountId);
         if (accountId !== undefined && (!Number.isSafeInteger(accountId) || accountId < 1)) {
           sendJson(response, 400, { error: "accountId must be a positive integer" });
           return;
         }
-        const referenceImagePath = await prepareReferenceImage(body, requestId);
+        const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
+        const referenceImagePaths = await prepareReferenceImages({
+          requestId,
+          uploadDir,
+          uploads: parsed.uploads,
+          localPaths: parsed.localPaths,
+          urls: parsed.urls
+        });
+        const referenceImagePath = referenceImagePaths[0] ?? null;
         refreshQuotas();
         const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio,
-          prompt, referenceImagePath, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
+          durationSeconds, prompt, referenceImagePath, referenceImagePaths, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
         if (!created) {
           const pinnedExhausted = accountId ? this.database.getAccount(accountId)?.dailyQuotaExhausted : false;
@@ -188,12 +217,14 @@ class LocalApiServer {
             source: body.source,
             model,
             aspectRatio,
+            durationSeconds,
             status: "failed",
             message: pinnedExhausted ? "豆包今日免费次数已用完；本任务指定了账号，不自动换号" : accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
             accountId: pinnedExhausted ? accountId : undefined,
             requestedAccountId: accountId,
             prompt,
             referenceImagePath,
+            referenceImagePaths,
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
@@ -321,10 +352,48 @@ class LocalApiServer {
 
       sendJson(response, 404, { error: "not found" });
     } catch (error) {
+      if (error instanceof HttpError) {
+        sendJson(response, error.statusCode, {
+          error: error.message,
+          ...(error.code ? { code: error.code } : {})
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : "Unknown error";
       sendJson(response, 500, { error: message });
     }
   }
+}
+
+const configuredDownloadSessions = new WeakSet<Session>();
+
+function configureSessionDownloads(target: Session) {
+  if (configuredDownloadSessions.has(target)) return;
+  configuredDownloadSessions.add(target);
+  target.on("will-download", (event, item) => {
+    const saveDir = db.getSettings().outputDir.trim();
+    if (!saveDir) {
+      event.preventDefault();
+      return;
+    }
+    try {
+      fs.mkdirSync(saveDir, { recursive: true });
+      item.setSavePath(uniqueDownloadPath(saveDir, item.getFilename()));
+    } catch {
+      event.preventDefault();
+    }
+  });
+}
+
+function uniqueDownloadPath(dir: string, filename: string) {
+  const safeName = path.basename(filename || "").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
+  const base = safeName || `doubao-video-${Date.now()}.mp4`;
+  const ext = path.extname(base);
+  const stem = ext ? base.slice(0, -ext.length) : base;
+  let target = path.join(dir, base);
+  let index = 2;
+  while (fs.existsSync(target)) target = path.join(dir, `${stem}-${index++}${ext}`);
+  return target;
 }
 
 function createMainWindow() {
@@ -540,169 +609,51 @@ function isAuthorized(request: IncomingMessage, apiKey: string) {
   return request.headers.authorization === `Bearer ${apiKey}`;
 }
 
-async function readGenerateRequest(request: IncomingMessage, requestId: string): Promise<GenerateRequestBody> {
+interface ParsedGenerateRequest {
+  body: GenerateRequestBody;
+  uploads: MultipartFilePart[];
+  localPaths: string[];
+  urls: string[];
+}
+
+async function readGenerateRequest(request: IncomingMessage): Promise<ParsedGenerateRequest> {
   const contentType = String(request.headers["content-type"] || "");
   if (contentType.includes("multipart/form-data")) {
-    return parseMultipartGenerateRequest(await readBufferBody(request), contentType, requestId);
-  }
-  return readJsonBody<GenerateRequestBody>(request);
-}
-
-async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
-  const raw = (await readBufferBody(request)).toString("utf8");
-  if (!raw.trim()) return {} as T;
-  return JSON.parse(raw) as T;
-}
-
-async function readBufferBody(request: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
-async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string, requestId: string): Promise<GenerateRequestBody> {
-  const boundary = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1] || contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
-  if (!boundary) throw new Error("multipart boundary is required");
-
-  const fields: Record<string, string> = {};
-  let uploadedReferenceImagePath: string | null = null;
-  const delimiter = Buffer.from(`--${boundary}`);
-
-  for (const rawPart of splitBuffer(buffer, delimiter)) {
-    let part = rawPart;
-    if (part.length === 0 || part.subarray(0, 2).toString() === "--") continue;
-    if (part.subarray(0, 2).toString() === "\r\n") part = part.subarray(2);
-    if (part.subarray(part.length - 2).toString() === "\r\n") part = part.subarray(0, part.length - 2);
-
-    const headerEnd = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (headerEnd < 0) continue;
-
-    const headerText = part.subarray(0, headerEnd).toString("utf8");
-    const body = part.subarray(headerEnd + 4);
-    const headers = parsePartHeaders(headerText);
-    const disposition = parseContentDisposition(headers["content-disposition"] || "");
-    if (!disposition.name) continue;
-
-    if (disposition.filename) {
-      if (!uploadedReferenceImagePath && body.length > 0) {
-        uploadedReferenceImagePath = await saveUploadedFile({
-          requestId,
-          fieldName: disposition.name,
-          filename: disposition.filename,
-          contentType: headers["content-type"],
-          bytes: body
-        });
-      }
-      continue;
-    }
-
-    fields[disposition.name] = body.toString("utf8");
+    const parsed = parseMultipartGenerateRequest(
+      await readBufferBody(request, MAX_GENERATE_REQUEST_BYTES),
+      contentType
+    );
+    return {
+      body: parsed.body,
+      uploads: parsed.files,
+      localPaths: toReferenceStringList(parsed.body.referenceImages, "referenceImages"),
+      urls: toReferenceStringList(parsed.body.referenceImageUrls, "referenceImageUrls")
+    };
   }
 
+  const body = await readJsonBody<GenerateRequestBody>(request, MAX_GENERATE_REQUEST_BYTES);
   return {
-    accountId: fields.accountId,
-    model: fields.model as DoubaoModel | undefined,
-    aspectRatio: fields.aspectRatio || null,
-    prompt: fields.prompt || "",
-    referenceImagePath: uploadedReferenceImagePath || fields.referenceImagePath || null,
-    referenceImageUrl: fields.referenceImageUrl || null,
-    removeWatermark: parseOptionalBoolean(fields.removeWatermark),
-    callbackUrl: fields.callbackUrl || null,
-    source: fields.source || "multipart-api"
+    body,
+    uploads: [],
+    localPaths: [
+      ...toReferenceStringList(body.referenceImages, "referenceImages"),
+      ...toReferenceStringList(body.referenceImagePath, "referenceImagePath")
+    ],
+    urls: [
+      ...toReferenceStringList(body.referenceImageUrls, "referenceImageUrls"),
+      ...toReferenceStringList(body.referenceImageUrl, "referenceImageUrl")
+    ]
   };
 }
 
-async function prepareReferenceImage(body: GenerateRequestBody, requestId: string) {
-  if (body.referenceImagePath?.trim()) return body.referenceImagePath.trim();
-  const imageUrl = body.referenceImageUrl?.trim();
-  if (!imageUrl) return null;
-
-  const response = await fetch(imageUrl);
-  if (!response.ok) {
-    throw new Error(`参考图下载失败：HTTP ${response.status}`);
+async function readJsonBody<T>(request: IncomingMessage, maxBytes = MAX_GENERATE_REQUEST_BYTES): Promise<T> {
+  const raw = (await readBufferBody(request, maxBytes)).toString("utf8");
+  if (!raw.trim()) return {} as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new HttpError("请求 JSON 格式无效", 400, "invalid_json");
   }
-
-  const contentType = response.headers.get("content-type") || "";
-  const urlExt = path.extname(new URL(imageUrl).pathname);
-  const ext = urlExt || extensionFromContentType(contentType) || ".png";
-  const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
-  await fs.mkdir(uploadDir, { recursive: true });
-  const imagePath = path.join(uploadDir, `${requestId}-reference${ext}`);
-  await fs.writeFile(imagePath, Buffer.from(await response.arrayBuffer()));
-  return imagePath;
-}
-
-async function saveUploadedFile(input: {
-  requestId: string;
-  fieldName: string;
-  filename: string;
-  contentType?: string;
-  bytes: Buffer;
-}) {
-  const safeName = sanitizeFilename(input.filename || `${input.fieldName}${extensionFromContentType(input.contentType) || ".png"}`);
-  const uploadDir = path.join(app.getPath("userData"), "uploads", new Date().toISOString().slice(0, 10));
-  await fs.mkdir(uploadDir, { recursive: true });
-  const filePath = path.join(uploadDir, `${input.requestId}-${input.fieldName}-${safeName}`);
-  await fs.writeFile(filePath, input.bytes);
-  return filePath;
-}
-
-function splitBuffer(buffer: Buffer, delimiter: Buffer) {
-  const parts: Buffer[] = [];
-  let start = 0;
-  let index = buffer.indexOf(delimiter, start);
-  while (index !== -1) {
-    if (index > start) {
-      parts.push(buffer.subarray(start, index));
-    }
-    start = index + delimiter.length;
-    index = buffer.indexOf(delimiter, start);
-  }
-  if (start < buffer.length) parts.push(buffer.subarray(start));
-  return parts;
-}
-
-function parsePartHeaders(value: string) {
-  const headers: Record<string, string> = {};
-  for (const line of value.split("\r\n")) {
-    const separator = line.indexOf(":");
-    if (separator < 0) continue;
-    headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
-  }
-  return headers;
-}
-
-function parseContentDisposition(value: string) {
-  const result: { name?: string; filename?: string } = {};
-  for (const item of value.split(";")) {
-    const [rawKey, ...rawValue] = item.trim().split("=");
-    const key = rawKey.trim().toLowerCase();
-    const unquoted = rawValue.join("=").trim().replace(/^"|"$/g, "");
-    if (key === "name") result.name = unquoted;
-    if (key === "filename") result.filename = unquoted;
-  }
-  return result;
-}
-
-function parseOptionalBoolean(value: string | undefined) {
-  if (value == null || value === "") return undefined;
-  return !["0", "false", "no", "off"].includes(value.toLowerCase());
-}
-
-function extensionFromContentType(contentType?: string) {
-  if (!contentType) return null;
-  if (contentType.includes("jpeg")) return ".jpg";
-  if (contentType.includes("png")) return ".png";
-  if (contentType.includes("webp")) return ".webp";
-  if (contentType.includes("gif")) return ".gif";
-  return null;
-}
-
-function sanitizeFilename(value: string) {
-  const cleaned = value.replace(/[/\\?%*:|"<>]/g, "_").trim();
-  return cleaned.slice(0, 120) || "reference-image";
 }
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown) {
@@ -745,6 +696,8 @@ if (!hasSingleInstanceLock) {
     db = new AppDatabase();
     executor = new DoubaoExecutor(db, notifyDataChanged, observeWatermarkResponse);
     apiServer = new LocalApiServer(db, executor);
+    app.on("web-contents-created", (_event, contents) => configureSessionDownloads(contents.session));
+    configureSessionDownloads(session.defaultSession);
     const queuedRequests = db.prepareQueueAfterRestart();
     quotaTimer = new DailyQuotaTimer(refreshQuotas);
     quotaTimer.start();

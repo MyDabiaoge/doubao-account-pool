@@ -1076,6 +1076,19 @@ pre {
   white-space: nowrap;
 }
 
+.request-detail-grid .reference-image-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.request-detail-grid .reference-image-list li {
+  overflow-wrap: anywhere;
+  white-space: normal;
+  color: #202631;
+}
+
 .request-detail-section {
   display: grid;
   gap: 8px;

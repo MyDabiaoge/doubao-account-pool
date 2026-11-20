@@ -30,6 +30,20 @@ export function doubaoAspectRatioFromText(value: string | null | undefined) {
   return has916 ? "9:16" : "16:9";
 }
 
+/**
+ * Reads the duration suffix of the collapsed video toolbar entry, for example
+ * `自动 · 10s`, `16:9 · 10 秒` or `9:16 · 5s`. Callers must only pass the
+ * toolbar summary text, never a free-form prompt.
+ */
+export function doubaoDurationFromText(value: string | null | undefined): number | null {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const match = text.match(/(?<!\d)(\d{1,2})\s*(?:s|秒)(?![a-z])/i);
+  if (!match) return null;
+  const seconds = Number(match[1]);
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 60 ? seconds : null;
+}
+
 export function isDoubaoAspectRatioTriggerText(value: string | null | undefined) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length > 48) return false;

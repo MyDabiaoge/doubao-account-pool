@@ -19,6 +19,15 @@ test('never confuses provider quota, content rejection or congestion with daily 
     assert.equal(isDoubaoDailyQuotaExhausted(text), false, text)
   }
 })
+test('classifies unconfirmed video settings as a submission-stage failure', () => {
+  const error = diagnoseRequest('豆包时长未确认：要求 10 秒，当前为未识别；页面 https://www.doubao.com/chat')
+  assert.equal(error.stage, 'submission')
+  assert.equal(error.code, 'video_settings_unconfirmed')
+  assert.equal(error.retryable, false)
+  assert.equal(requestPhase({ status: 'failed', message: error.detail, error }), error.title)
+  assert.equal(requestPhase({ status: 'running', message: '正在设置豆包时长：10s', error: null }), '准备生成')
+})
+
 test('shows a precise account-level failure without hiding the original reply', () => {
   const error = diagnoseRequest(`豆包返回失败：${actualReply}，已退回预扣额度`)
   assert.equal(error.stage, 'account')

@@ -18,12 +18,13 @@ async function installFixture(page: Page) {
       dailyResetTime: '00:00', generationTimeoutSeconds: 900, maxConcurrentAccounts: 5, maxConcurrentTasksPerAccount: 3, retryCount: 1, autoRemoveWatermark: true,
       watermarkApiUrl: 'https://example.invalid/parse', watermarkApiToken: 'fixture-only', outputDir: ''
     };
-    const base = { model: 'seedance_2_0_mini', aspectRatio: '16:9', source: 'infinite-canvas', referenceImagePath: null, removeWatermark: true, callbackUrl: null,
+    const base = { model: 'seedance_2_0_mini', aspectRatio: '16:9', durationSeconds: 10, source: 'infinite-canvas', referenceImagePath: null, referenceImagePaths: [], removeWatermark: true, callbackUrl: null,
       doubaoThreadUrl: null, rawVideoUrl: null, cleanVideoUrl: null, outputVideoPath: null, quotaRefunded: false, createdAt: now, updatedAt: now, finishedAt: null, error: null };
     const requests: any[] = [
       { ...base, id: 4, requestId: 'doubao-ui-confirmation', accountId: 3, accountName: '账号 003', accountPartition: accounts[2].partition, status: 'running',
         message: '尚未确认视频启动，60 秒后补发“确认生成”', prompt: '人物设定：同一位女性，温暖二维水彩风格。\n0—2 秒：从办公桌前起身。\n2—5 秒：在走廊缓慢走动。\n5—10 秒：窗边舒展双臂。\n旁白原字保留，16:9，10秒。' },
       { ...base, id: 3, requestId: 'doubao-ui-watermark', accountId: 4, accountName: '账号 004', accountPartition: accounts[3].partition, status: 'failed',
+        referenceImagePath: '/fixtures/reference-a.png', referenceImagePaths: ['/fixtures/reference-a.png', '/fixtures/reference-b.png'],
         message: '去水印次数已耗尽：API Token调用次数已耗尽', prompt: '完整提示词示例：傍晚，女性靠在沙发上，镜头缓慢拉远。'.repeat(20),
         error: { stage: 'watermark', code: 'quota_exhausted', title: '去水印次数已耗尽', detail: 'API Token调用次数已耗尽', suggestion: '补充去水印次数后恢复结果，无需重新生成视频。', retryable: false } },
       { ...base, id: 2, requestId: 'doubao-ui-sharing', accountId: 2, accountName: '账号 002', accountPartition: accounts[1].partition, status: 'failed',
@@ -92,6 +93,11 @@ test('filters watermark failures and restores an existing result from live detai
   const drawer = page.getByRole('dialog');
   await expect(drawer.getByRole('heading', { name: '去水印次数已耗尽' })).toBeVisible();
   await expect(drawer.getByText('补充去水印次数后恢复结果，无需重新生成视频。')).toBeVisible();
+  await expect(drawer.getByText('参考图（2 张）')).toBeVisible();
+  await expect(drawer).toContainText('10 秒');
+  await expect(drawer.locator('.reference-image-list li')).toHaveCount(2);
+  await expect(drawer.locator('.reference-image-list li').nth(0)).toHaveText('/fixtures/reference-a.png');
+  await expect(drawer.locator('.reference-image-list li').nth(1)).toHaveText('/fixtures/reference-b.png');
   await page.screenshot({ path: 'test-results/error-drawer-desktop.png', fullPage: true });
   await drawer.getByRole('button', { name: '恢复结果', exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as any).__fixture.recovered)).toBe(1);

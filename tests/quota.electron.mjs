@@ -190,6 +190,6 @@ app.whenReady().then(async () => {
     db.stopApiRequestAndRefund(task.requestId); assert.equal(db.getAccount(other.id).quotaRemaining, 10)
   })
   console.log('QUOTA_RESULTS ' + JSON.stringify(results))
-  fs.rmSync(root, { recursive: true, force: true })
+  try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) } catch { /* Chromium may still hold profile files until the process exits. */ }
   app.exit(results.every(item => item.ok) ? 0 : 1)
 }).catch(error => { console.error(error); app.exit(1) })

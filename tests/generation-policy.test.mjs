@@ -25,6 +25,42 @@ test('accepts fresh formal Mini/Fast acknowledgements, including Markdown and li
   assert.equal(hasFormalGenerationAcknowledgement('本次使用\nSeedance 2.0 Fast\n生成，大约需要 1-3 分钟。视频生成好后，我会主动发送给你。', 'Seedance 2.0 Fast'), true)
 })
 
+test('accepts the parameter confirmation reply triggered by the copyright-risk follow-up', () => {
+  const reply = [
+    '收到✅，已确认参数，并且知悉版权风险由你自行承担，马上启动视频生成：',
+    '- 模型：Seedance 2.0 Mini',
+    '- 时长：10s',
+    '- 画幅：9:16 竖屏',
+    '- 分辨率：720p',
+    '请稍等，视频渲染完成后会发给你。'
+  ].join('\n')
+  assert.equal(hasFormalGenerationAcknowledgement(reply, 'Seedance 2.0 Mini'), true)
+  assert.equal(hasNewFormalGenerationAcknowledgement(reply, '新对话', 'Seedance 2.0 Mini'), true)
+  assert.equal(hasNewFormalGenerationAcknowledgement(reply, reply, 'Seedance 2.0 Mini'), false)
+  assert.equal(hasFormalGenerationAcknowledgement(reply, 'Seedance 2.0 Fast'), false)
+
+  // 没有实际启动承诺的纯文字回复仍然不算受理。
+  assert.equal(
+    hasFormalGenerationAcknowledgement('收到，已确认参数，模型：Seedance 2.0 Mini，马上为你整理提示词。', 'Seedance 2.0 Mini'),
+    false
+  )
+})
+
+test('accepts the "版权自担声明 / 生成任务已提交" acknowledgement variant', () => {
+  const reply = [
+    '收到✅，已确认你的版权自担声明，按照设定开始生成：',
+    '参数：10s｜9:16｜720p｜Seedance 2.0 Mini',
+    '参考图：第 5 张三宫格分镜，严格遵循这套镜头流程、人物形象、压抑氛围、音频规则，无台词无背景音乐。',
+    '',
+    '生成任务已提交，请稍等片刻。',
+    '等视频出来之后，如果你想微调镜头节奏、光影强弱，随时跟我说。'
+  ].join('\n')
+  assert.equal(hasFormalGenerationAcknowledgement(reply, 'Seedance 2.0 Mini'), true)
+  assert.equal(hasNewFormalGenerationAcknowledgement(reply, '新对话', 'Seedance 2.0 Mini'), true)
+  assert.equal(hasNewFormalGenerationAcknowledgement(reply, reply, 'Seedance 2.0 Mini'), false)
+  assert.equal(hasFormalGenerationAcknowledgement(reply, 'Seedance 2.0 Fast'), false)
+})
+
 const policy = { now: 1000, stableSince: 1000, lastConfirmationAt: 0, confirmationCount: 0, accepted: false, responding: false, hasDraft: false }
 
 test('waits 60 seconds for the first confirmation and 120 for the second', () => {

@@ -10,6 +10,7 @@ import {
   extractNewDoubaoReply,
   extractDoubaoWatermarkShareUrl,
   doubaoAspectRatioFromText,
+  doubaoDurationFromText,
   isDoubaoAspectRatioTriggerText,
   doubaoVideoModelFromText,
   doubaoVideoModelLabel,
@@ -40,6 +41,12 @@ import { diagnoseRequest } from "./request-diagnostics.js";
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoAspectRatio, DoubaoModel, RequestErrorInfo } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource, WatermarkError } from "./watermark.js";
 import type { WatermarkProviderObserver } from "./watermark-state.js";
+import { MAX_REFERENCE_IMAGES } from "./reference-images.js";
+import {
+  DOUBAO_DURATION_MAX_SECONDS,
+  DOUBAO_DURATION_MIN_SECONDS,
+  normalizeDoubaoDurationSeconds
+} from "./generation-options.js";
 
 type DataChangedCallback = () => void;
 type QueueItem = {
@@ -99,7 +106,7 @@ const SHARE_PANEL_WAIT_MS = 3500;
 const PAGE_SHARE_CAPTURE_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
-const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成";
+const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成。申明：版权风险由个人承担！";
 const PREFERRED_CONVERSATION_RETRY_MS = 75000;
 const RECENT_CONVERSATION_FALLBACK_LIMIT = 10;
 const callbackQueues = new Map<string, Promise<void>>();
@@ -348,6 +355,13 @@ export class DoubaoExecutor {
     const progress = (input: Parameters<AppDatabase["updateApiRequest"]>[0]) =>
       this.updateProgress({ ...input, assignmentRevision: request.assignmentRevision });
     const settings = this.database.getSettings();
+    const referenceImagePaths = (
+      request.referenceImagePaths?.length
+        ? request.referenceImagePaths
+        : request.referenceImagePath
+          ? [request.referenceImagePath]
+          : []
+    ).map(item => path.resolve(item));
     let win: BrowserWindow | null = null;
     let submittedToDoubao = false;
     let keepWindowOpen = false;
@@ -408,19 +422,43 @@ export class DoubaoExecutor {
           });
         }
 
+        const requestedDuration = normalizeDoubaoDurationSeconds(request.durationSeconds);
+        if (requestedDuration) {
+          await progress({
+            requestId,
+            status: "running",
+            message: `正在设置豆包时长：${requestedDuration}s`
+          });
+          const durationResult = await selectDoubaoDuration(win!, requestedDuration);
+          await progress({
+            requestId,
+            status: "running",
+            message: durationResult.attempts > 0
+              ? `豆包时长已确认：${durationResult.before ? `${durationResult.before}s -> ` : ""}${durationResult.after}s（第 ${durationResult.attempts} 次）`
+              : `豆包时长已确认：${durationResult.after}s`
+          });
+        }
+
         await progress({
           requestId,
           status: "running",
           message: formatGenerationSettings(request)
         });
 
-        if (request.referenceImagePath) {
+        if (referenceImagePaths.length) {
           await progress({
             requestId,
             status: "running",
-            message: attempt === 1 ? "正在上传参考图" : "正在重新上传参考图"
+            message: attempt === 1
+              ? `正在上传参考图（共 ${referenceImagePaths.length} 张）`
+              : `正在重新上传参考图（第 ${attempt}/3 次提交，共 ${referenceImagePaths.length} 张）`
           });
-          await uploadReferenceImage(win!, request.referenceImagePath);
+          const upload = await uploadReferenceImages(win!, referenceImagePaths);
+          await progress({
+            requestId,
+            status: "running",
+            message: `参考图已全部上传：${upload.verified}/${referenceImagePaths.length} 张（${upload.mode}）`
+          });
         }
 
         await progress({
@@ -844,14 +882,49 @@ async function looksLoggedOut(win: BrowserWindow) {
   `);
 }
 
-async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
-  const resolvedPath = path.resolve(imagePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
-  if (!stat?.isFile()) {
-    throw new Error(`参考图不存在：${resolvedPath}`);
+type ReferenceUploadResult = {
+  verified: number;
+  multiple: boolean;
+  mode: "单张" | "单次多选" | "逐张添加";
+};
+
+type FileInputDescriptor = {
+  nodeId: number;
+  multiple: boolean;
+  accept: string | null;
+};
+
+async function uploadReferenceImages(win: BrowserWindow, imagePaths: string[]): Promise<ReferenceUploadResult> {
+  const uniquePaths: string[] = [];
+  const seen = new Set<string>();
+  for (const imagePath of imagePaths) {
+    const resolved = path.resolve(imagePath);
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniquePaths.push(resolved);
   }
 
-  if (await setFirstFileInput(win, resolvedPath)) {
+  if (uniquePaths.length > MAX_REFERENCE_IMAGES) {
+    throw new Error(`参考图数量超过上限：${uniquePaths.length}/${MAX_REFERENCE_IMAGES}`);
+  }
+  for (const imagePath of uniquePaths) {
+    const stat = await fs.stat(imagePath).catch(() => null);
+    if (!stat?.isFile()) throw new Error(`参考图不存在：${imagePath}`);
+    if (stat.size === 0) throw new Error(`参考图为空：${imagePath}`);
+  }
+
+  if (!uniquePaths.length) return { verified: 0, multiple: false, mode: "单张" };
+  if (uniquePaths.length === 1) {
+    await uploadSingleReferenceImage(win, uniquePaths[0]);
+    return { verified: 1, multiple: false, mode: "单张" };
+  }
+
+  return uploadMultipleReferenceImages(win, uniquePaths);
+}
+
+async function uploadSingleReferenceImage(win: BrowserWindow, imagePath: string) {
+  if (await setFirstFileInput(win, imagePath)) {
     await wait(2500);
     return;
   }
@@ -859,7 +932,7 @@ async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
   await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
   await wait(1200);
 
-  if (await setFirstFileInput(win, resolvedPath)) {
+  if (await setFirstFileInput(win, imagePath)) {
     await wait(2500);
     return;
   }
@@ -867,7 +940,43 @@ async function uploadReferenceImage(win: BrowserWindow, imagePath: string) {
   throw new Error("没有找到豆包页面的图片上传控件");
 }
 
-async function setFirstFileInput(win: BrowserWindow, filePath: string) {
+async function uploadMultipleReferenceImages(win: BrowserWindow, imagePaths: string[]): Promise<ReferenceUploadResult> {
+  return withDebugger(win, async send => {
+    let descriptor = await findFileInput(send);
+    if (!descriptor) {
+      await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
+      await wait(1200);
+      descriptor = await findFileInput(send);
+    }
+    if (!descriptor) throw new Error("没有找到豆包页面的图片上传控件");
+
+    const before = await readAttachmentState(win);
+    if (descriptor.multiple) {
+      await send("DOM.setFileInputFiles", { nodeId: descriptor.nodeId, files: imagePaths });
+      await wait(2500);
+      await waitForAttachmentDelta(win, imagePaths.length, before, descriptor, 10_000);
+      return { verified: imagePaths.length, multiple: true, mode: "单次多选" };
+    }
+
+    for (let index = 0; index < imagePaths.length; index += 1) {
+      let current = await findFileInput(send);
+      if (!current) {
+        await clickByKeywords(win, ["上传", "参考图", "图片", "添加图片", "附件", "image", "upload"]);
+        await wait(1200);
+        current = await findFileInput(send);
+      }
+      if (!current) throw new Error("没有找到豆包页面的图片上传控件");
+      await send("DOM.setFileInputFiles", { nodeId: current.nodeId, files: [imagePaths[index]] });
+      await waitForAttachmentDelta(win, index + 1, before, current, 5_000);
+    }
+    return { verified: imagePaths.length, multiple: false, mode: "逐张添加" };
+  });
+}
+
+async function withDebugger<T>(
+  win: BrowserWindow,
+  run: (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<T>
+): Promise<T> {
   const debug = win.webContents.debugger;
   let attachedHere = false;
   try {
@@ -875,25 +984,119 @@ async function setFirstFileInput(win: BrowserWindow, filePath: string) {
       debug.attach("1.3");
       attachedHere = true;
     }
-    const documentResult = await debug.sendCommand("DOM.getDocument", { depth: -1, pierce: true }) as {
-      root: { nodeId: number };
-    };
-    const inputs = await debug.sendCommand("DOM.querySelectorAll", {
-      nodeId: documentResult.root.nodeId,
-      selector: 'input[type="file"]'
-    }) as { nodeIds: number[] };
-
-    if (!inputs.nodeIds.length) return false;
-    await debug.sendCommand("DOM.setFileInputFiles", {
-      nodeId: inputs.nodeIds[0],
-      files: [filePath]
-    });
-    return true;
+    return await run((method, params) => debug.sendCommand(method, params));
   } finally {
     if (attachedHere && debug.isAttached()) {
       debug.detach();
     }
   }
+}
+
+async function findFileInput(
+  send: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+): Promise<FileInputDescriptor | null> {
+  const documentResult = await send("DOM.getDocument", { depth: -1, pierce: true }) as {
+    root: { nodeId: number };
+  };
+  const inputs = await send("DOM.querySelectorAll", {
+    nodeId: documentResult.root.nodeId,
+    selector: 'input[type="file"]'
+  }) as { nodeIds: number[] };
+
+  let fallback: FileInputDescriptor | null = null;
+  for (const nodeId of inputs.nodeIds) {
+    let attributes: string[];
+    try {
+      attributes = (await send("DOM.getAttributes", { nodeId }) as { attributes: string[] }).attributes;
+    } catch {
+      continue;
+    }
+    const values: Record<string, string> = {};
+    for (let index = 0; index + 1 < attributes.length; index += 2) {
+      values[attributes[index].toLowerCase()] = attributes[index + 1];
+    }
+    const descriptor: FileInputDescriptor = {
+      nodeId,
+      multiple: "multiple" in values,
+      accept: values.accept || null
+    };
+    if (!descriptor.accept || descriptor.accept.includes("image")) return descriptor;
+    fallback ??= descriptor;
+  }
+  return fallback;
+}
+
+async function setFirstFileInput(win: BrowserWindow, filePath: string) {
+  return withDebugger(win, async send => {
+    const descriptor = await findFileInput(send);
+    if (!descriptor) return false;
+    await send("DOM.setFileInputFiles", { nodeId: descriptor.nodeId, files: [filePath] });
+    return true;
+  });
+}
+
+async function readAttachmentState(win: BrowserWindow) {
+  return runPageScript<{ inputFiles: number; previews: number; backgrounds: number; sample: string[] }>(win, `(() => {
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 4 && rect.height > 4 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    const inputFiles = inputs.reduce((max, input) => Math.max(max, input.files ? input.files.length : 0), 0);
+    const roots = Array.from(document.querySelectorAll(
+      '[aria-label="doc_editor"], [class*="composer"], [class*="editor"], [class*="upload"], [class*="attach"], [class*="preview"], [class*="thumbnail"], [class*="image"]'
+    )).filter(visible);
+    const scopes = roots.length ? roots : [document.body];
+    const seen = new Set();
+    const sample = [];
+    let previews = 0;
+    let backgrounds = 0;
+    for (const scope of scopes) {
+      for (const img of scope.querySelectorAll("img")) {
+        if (seen.has(img) || !visible(img)) continue;
+        const src = img.currentSrc || img.src || "";
+        if (src.startsWith("blob:") || src.startsWith("data:image/")) {
+          seen.add(img);
+          previews += 1;
+          if (sample.length < 5) sample.push(img.className || img.tagName);
+        }
+      }
+      const elements = Array.from(scope.querySelectorAll("*")).slice(0, 3000);
+      for (const el of elements) {
+        if (seen.has(el) || el.tagName === "IMG" || !visible(el)) continue;
+        const background = getComputedStyle(el).backgroundImage || "";
+        if (background.includes("blob:") || background.includes("data:image/")) {
+          backgrounds += 1;
+          if (sample.length < 5) sample.push(el.className || el.tagName);
+        }
+      }
+    }
+    return { inputFiles, previews, backgrounds, sample };
+  })()`);
+}
+
+async function waitForAttachmentDelta(
+  win: BrowserWindow,
+  expectedDelta: number,
+  before: Awaited<ReturnType<typeof readAttachmentState>>,
+  descriptor: FileInputDescriptor,
+  timeoutMs: number
+) {
+  const total = (state: Awaited<ReturnType<typeof readAttachmentState>>) =>
+    Math.max(state.inputFiles, state.previews, state.backgrounds);
+  const deadline = Date.now() + timeoutMs;
+  let latest = await readAttachmentState(win);
+  while (Date.now() < deadline) {
+    if (total(latest) - total(before) >= expectedDelta) return latest;
+    await wait(500);
+    latest = await readAttachmentState(win);
+  }
+  throw new Error(
+    `参考图上传校验失败：预期 ${expectedDelta} 张新附件，检测到 ${total(latest) - total(before)} 张`
+    + `（inputFiles=${latest.inputFiles}, previews=${latest.previews}, backgrounds=${latest.backgrounds},`
+    + ` multiple=${descriptor.multiple}, accept=${descriptor.accept || "none"}, sample=${latest.sample.join(",")}）`
+  );
 }
 
 async function fillPrompt(win: BrowserWindow, prompt: string) {
@@ -1033,8 +1236,12 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const diagnostics: string[] = [];
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    // A previous attempt may have switched modes after its wait timed out.
+    // Check before pressing Escape so a late render is not dismissed.
+    let current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 1200);
+    if (current.currentModel === target) return;
     await sendKeyboard(win, "Escape", undefined, 150);
-    let current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 800);
+    current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 800);
     if (current.currentModel === target) return;
 
     if (attempt === 2 && !current.currentModel) {
@@ -1051,7 +1258,9 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
       if (videoMode) {
         await sendMouseClick(win, videoMode.x, videoMode.y);
         diagnostics.push(`第 ${attempt} 次点击视频入口 ${videoMode.debug}`);
-        current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 3200);
+        // Switching to video mode replaces the composer and can take several
+        // seconds on a busy page; a short timeout reports a false failure.
+        current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 6000);
         if (current.currentModel === target) return;
       } else {
         diagnostics.push(`第 ${attempt} 次未找到视频生成入口`);
@@ -1115,13 +1324,40 @@ async function findExactDoubaoActionPoint(win: BrowserWindow, label: string, all
         el.getAttribute("title"),
         el.textContent
       ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const semantic = 'button, [role="button"], a, [tabindex]';
+      const pickClickTarget = (el) => {
+        if (el.matches(semantic)) return el;
+        const ownRect = el.getBoundingClientRect();
+        // Doubao wraps toolbar labels in large containers that also carry an
+        // aria-label. Clicking the container's center lands in the middle of
+        // the composer instead of the label, so prefer a control inside the
+        // matched element, then a reasonably sized ancestor.
+        const inner = Array.from(el.querySelectorAll(semantic)).find((node) => {
+          if (!visible(node)) return false;
+          const nodeRect = node.getBoundingClientRect();
+          const nodeText = compact(textOf(node));
+          return (nodeText === targetText || (allowPrefix && nodeText.startsWith(targetText)))
+            && nodeRect.width <= Math.max(ownRect.width * 4, 240)
+            && nodeRect.height <= Math.max(ownRect.height * 4, 80);
+        });
+        if (inner) return inner;
+        const ancestor = el.closest('button, [role="button"], a, [tabindex], [aria-label], [title]');
+        if (ancestor) {
+          const ancestorRect = ancestor.getBoundingClientRect();
+          const proportionate = ancestorRect.width <= Math.max(ownRect.width * 4, 240)
+            && ancestorRect.height <= Math.max(ownRect.height * 4, 80)
+            && ancestorRect.width * ancestorRect.height <= Math.max(ownRect.width * ownRect.height * 16, 32000);
+          if (proportionate) return ancestor;
+        }
+        return el;
+      };
       const candidates = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
         .filter((el) => !el.closest('[role="dialog"], [role="menu"], [role="listbox"]'))
         .map((el) => {
           const text = textOf(el);
           const normalized = compact(text);
-          const clickable = el.closest('button, [role="button"], a, [tabindex], [aria-label], [title]') || el;
+          const clickable = pickClickTarget(el);
           const rect = clickable.getBoundingClientRect();
           const exact = normalized === targetText;
           const prefix = allowPrefix && normalized.startsWith(targetText)
@@ -1138,11 +1374,14 @@ async function findExactDoubaoActionPoint(win: BrowserWindow, label: string, all
           || b.rect.bottom - a.rect.bottom
           || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       const target = candidates[0];
-      return target ? {
-        x: Math.round(target.rect.left + target.rect.width / 2),
-        y: Math.round(target.rect.top + target.rect.height / 2),
-        debug: target.text
-      } : null;
+      if (!target) return null;
+      const x = Math.round(target.rect.left + target.rect.width / 2);
+      const y = Math.round(target.rect.top + target.rect.height / 2);
+      return {
+        x,
+        y,
+        debug: target.text + "@" + x + "," + y + " (" + target.clickable.tagName + ")"
+      };
     })()
   `);
 }
@@ -1366,6 +1605,7 @@ async function waitForDoubaoVideoModelOption(
 
 type DoubaoAspectRatioState = {
   currentAspectRatio: DoubaoAspectRatio | null;
+  currentDurationSeconds: number | null;
   summary: string | null;
   labels: string[];
 };
@@ -1374,6 +1614,7 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
   return runPageScript<DoubaoAspectRatioState>(win, `
     (() => {
       const ratioFromText = ${doubaoAspectRatioFromText.toString()};
+      const durationFromText = ${doubaoDurationFromText.toString()};
       const isTriggerText = ${isDoubaoAspectRatioTriggerText.toString()};
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -1425,7 +1666,7 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
             rect
           };
         })
-        .filter((item) => item.ratio);
+        .filter((item) => item.ratio || isTriggerText(item.text));
       const trigger = items
         .filter((item) => item.summary)
         .sort((a, b) => b.rect.bottom - a.rect.bottom || a.text.length - b.text.length)[0];
@@ -1433,6 +1674,7 @@ async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
         // Only the collapsed toolbar summary is authoritative. A highlighted
         // option in an open popover does not prove that Doubao applied it.
         currentAspectRatio: trigger?.ratio || null,
+        currentDurationSeconds: trigger ? durationFromText(trigger.text) : null,
         summary: trigger?.text || null,
         labels: items.map((item) => item.text).slice(0, 12)
       };
@@ -1587,7 +1829,7 @@ async function waitForDoubaoAspectRatioState(
   timeoutMs: number
 ) {
   const deadline = Date.now() + timeoutMs;
-  let latest: DoubaoAspectRatioState = { currentAspectRatio: null, summary: null, labels: [] };
+  let latest: DoubaoAspectRatioState = { currentAspectRatio: null, currentDurationSeconds: null, summary: null, labels: [] };
   while (Date.now() < deadline) {
     try {
       latest = await inspectSelectedDoubaoAspectRatio(win);
@@ -1670,6 +1912,373 @@ async function selectDoubaoAspectRatio(win: BrowserWindow, targetRatio: DoubaoAs
     `豆包画幅未确认：要求 ${targetRatio}，当前为 ${state.currentAspectRatio || "未识别"}`
       + `；页面 ${win.webContents.getURL()}`
       + `；可见画幅 ${state.labels.join(" | ") || "无"}`
+      + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
+  );
+}
+
+type DoubaoDurationPanelState = {
+  found: boolean;
+  min: number;
+  max: number;
+  current: number | null;
+  currentAria: number | null;
+  ariaMin: number | null;
+  ariaMax: number | null;
+  focusPoint: { x: number; y: number } | null;
+  handle: { x: number; y: number; left: number; top: number; width: number; height: number } | null;
+  track: { left: number; top: number; width: number; height: number } | null;
+  summary: string | null;
+  labels: string[];
+};
+
+async function inspectDoubaoDurationPanel(win: BrowserWindow) {
+  return runPageScript<DoubaoDurationPanelState>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const compact = (value) => String(value || "").replace(/\\s+/g, "");
+      const secondsFromLabel = (value) => {
+        const match = compact(value).match(/^(\\d{1,2})(?:s|秒)$/i);
+        return match ? Number(match[1]) : null;
+      };
+      const inputNumber = (el, prop) => {
+        const raw = el[prop];
+        if (raw === undefined || raw === null || raw === "") return null;
+        const value = Number(raw);
+        return Number.isFinite(value) ? value : null;
+      };
+      const readNumber = (el, name) => {
+        const raw = el.getAttribute(name);
+        if (raw === null || raw === "") return null;
+        const value = Number(raw);
+        return Number.isFinite(value) ? value : null;
+      };
+      const isSliderControl = (el) => el.tagName === "INPUT" && String(el.type).toLowerCase() === "range"
+        || el.getAttribute("role") === "slider"
+        || el.hasAttribute("aria-valuenow");
+
+      // The duration section is the smallest visible container that owns both
+      // the 时长 label and a slider control. The ratio grid shares the same
+      // popover, so a larger ancestor must not win.
+      const panels = Array.from(document.querySelectorAll("body *"))
+        .filter(visible)
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return { el, rect, text: compact(textOf(el)) };
+        })
+        .filter((item) => item.text.includes("时长")
+          && item.rect.width >= 120
+          && item.rect.width <= 720
+          && item.rect.height >= 30
+          && item.rect.height <= 720
+          && Array.from(item.el.querySelectorAll("input, [role='slider'], [aria-valuenow]")).some(isSliderControl))
+        .sort((a, b) => a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const panel = panels[0];
+      if (!panel) {
+        return {
+          found: false, min: 4, max: 15, current: null, currentAria: null,
+          ariaMin: null, ariaMax: null, focusPoint: null, handle: null, track: null,
+          summary: null, labels: []
+        };
+      }
+
+      const within = [panel.el, ...Array.from(panel.el.querySelectorAll("*"))].filter(visible);
+      const control = within.find(isSliderControl) || null;
+      const labels = within
+        .map((el) => ({ text: textOf(el), rect: el.getBoundingClientRect() }))
+        .map((item) => ({ ...item, seconds: secondsFromLabel(item.text) }))
+        .filter((item) => item.seconds !== null && item.rect.width > 0 && item.rect.height > 0);
+      // Doubao renders a Radix Slider. Its aria values are step indices
+      // (0..11) while the visible captions are 4s..15s, so the endpoint
+      // captions are the source of truth for seconds.
+      const distinctLabelValues = Array.from(new Set(labels.map((item) => item.seconds))).sort((a, b) => a - b);
+      const labelMin = distinctLabelValues.length >= 2 ? distinctLabelValues[0] : null;
+      const labelMax = distinctLabelValues.length >= 2 ? distinctLabelValues[distinctLabelValues.length - 1] : null;
+
+      let current = null;
+      let currentAria = null;
+      let ariaMin = null;
+      let ariaMax = null;
+      let focusPoint = null;
+      let handle = null;
+      let track = null;
+      if (control) {
+        ariaMin = readNumber(control, "aria-valuemin");
+        ariaMax = readNumber(control, "aria-valuemax");
+        currentAria = readNumber(control, "aria-valuenow");
+        if (control.tagName === "INPUT") {
+          if (ariaMin === null) ariaMin = inputNumber(control, "min");
+          if (ariaMax === null) ariaMax = inputNumber(control, "max");
+          if (currentAria === null) currentAria = inputNumber(control, "value");
+        }
+        const controlRect = control.getBoundingClientRect();
+        focusPoint = {
+          x: Math.round(controlRect.left + controlRect.width / 2),
+          y: Math.round(controlRect.top + controlRect.height / 2)
+        };
+        if (control.getAttribute("role") === "slider" || control.hasAttribute("aria-valuenow")) {
+          handle = {
+            x: focusPoint.x,
+            y: focusPoint.y,
+            left: controlRect.left,
+            top: controlRect.top,
+            width: controlRect.width,
+            height: controlRect.height
+          };
+          for (let parent = control.parentElement, depth = 0; parent && depth < 5; parent = parent.parentElement, depth += 1) {
+            if (!panel.el.contains(parent) || !visible(parent)) continue;
+            const rect = parent.getBoundingClientRect();
+            if (rect.width >= 100 && rect.height >= 8 && rect.height <= 80 && rect.width <= panel.rect.width + 1) {
+              track = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+              break;
+            }
+          }
+        } else {
+          track = { left: controlRect.left, top: controlRect.top, width: controlRect.width, height: controlRect.height };
+        }
+      }
+
+      if (!track) {
+        // Pointer-driven sliders sometimes omit ARIA values entirely. Fall
+        // back to the widest thin horizontal strip in the duration section.
+        const strips = within
+          .map((el) => el.getBoundingClientRect())
+          .filter((rect) => rect.width >= 80 && rect.width <= panel.rect.width + 1 && rect.height > 0 && rect.height <= 12)
+          .sort((a, b) => b.width - a.width);
+        const strip = strips[0];
+        if (strip) track = { left: strip.left, top: strip.top, width: strip.width, height: strip.height };
+      }
+
+      if (currentAria !== null) {
+        if (labelMin !== null && labelMax !== null && labelMax > labelMin
+          && ariaMin !== null && ariaMax !== null && ariaMax > ariaMin) {
+          current = Math.round(labelMin + (currentAria - ariaMin) / (ariaMax - ariaMin) * (labelMax - labelMin));
+        } else {
+          current = currentAria;
+        }
+      }
+      if (current === null && track) {
+        // The floating value bubble sits above the thumb; only trust a label
+        // near the track, never the endpoint captions below it.
+        const above = labels
+          .filter((item) => item.rect.bottom <= track.top + 4)
+          .sort((a, b) => Math.abs(a.rect.left + a.rect.width / 2 - (track.left + track.width / 2))
+            - Math.abs(b.rect.left + b.rect.width / 2 - (track.left + track.width / 2)));
+        if (above[0]) current = above[0].seconds;
+      }
+
+      return {
+        found: true,
+        min: labelMin !== null ? labelMin : ariaMin !== null ? ariaMin : 4,
+        max: labelMax !== null ? labelMax : ariaMax !== null ? ariaMax : 15,
+        current,
+        currentAria,
+        ariaMin,
+        ariaMax,
+        focusPoint,
+        handle,
+        track,
+        summary: textOf(panel.el).slice(0, 160),
+        labels: Array.from(new Set(labels.map((item) => item.text.trim()))).slice(0, 12)
+      };
+    })()
+  `);
+}
+
+async function waitForDoubaoDurationPanel(
+  win: BrowserWindow,
+  predicate: (state: DoubaoDurationPanelState) => boolean,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  let latest: DoubaoDurationPanelState = {
+    found: false, min: DOUBAO_DURATION_MIN_SECONDS, max: DOUBAO_DURATION_MAX_SECONDS,
+    current: null, currentAria: null, ariaMin: null, ariaMax: null,
+    focusPoint: null, handle: null, track: null, summary: null, labels: []
+  };
+  while (Date.now() < deadline) {
+    try {
+      latest = await inspectDoubaoDurationPanel(win);
+      if (predicate(latest)) return latest;
+    } catch {
+      // The popover can be replaced while the video composer initializes.
+    }
+    await wait(200);
+  }
+  return latest;
+}
+
+async function focusDoubaoDurationThumb(win: BrowserWindow, point: { x: number; y: number }) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const el = document.elementFromPoint(${point.x}, ${point.y});
+      const slider = el && (el.closest('[role="slider"]') || el.closest('input[type="range"]') || el);
+      if (!slider || typeof slider.focus !== "function") return false;
+      slider.focus();
+      return document.activeElement === slider;
+    })()
+  `);
+}
+
+async function applyDoubaoDuration(win: BrowserWindow, targetSeconds: number) {
+  const panel = await waitForDoubaoDurationPanel(win, (state) => state.found, 2600);
+  if (!panel.found) return { ok: false, current: null as number | null, detail: "未找到时长设置" };
+  if (panel.current === targetSeconds) return { ok: true, current: targetSeconds, detail: `菜单已显示 ${targetSeconds}s` };
+
+  const target = Math.min(panel.max, Math.max(panel.min, targetSeconds));
+  const notes: string[] = [];
+
+  // Doubao uses a Radix slider whose aria values are step indices. Focusing
+  // the thumb and stepping with the keyboard is the reliable way to change it;
+  // synthetic mouse drags do not update its internal state.
+  if (panel.focusPoint) {
+    win.webContents.focus();
+    const focused = await focusDoubaoDurationThumb(win, panel.focusPoint);
+    if (focused) {
+      let state = panel;
+      for (let attempt = 0; attempt < 24 && state.current !== null && state.current !== target; attempt += 1) {
+        const before = state.current;
+        // Electron's sendInputEvent accepts accelerator key names; "Left" and
+        // "Right" arrive in the page as DOM ArrowLeft/ArrowRight. The DOM-style
+        // spelling is ignored and leaves the Radix thumb unchanged.
+        await sendKeyboard(win, before < target ? "Right" : "Left", undefined, 140);
+        state = await inspectDoubaoDurationPanel(win);
+        if (state.current === null || state.current === before) break;
+      }
+      if (state.current === target) {
+        return { ok: true, current: target, detail: `键盘调整时长到 ${target}s` };
+      }
+      notes.push(`键盘调整后为 ${state.current ?? "未识别"}s`);
+    } else {
+      notes.push("未能聚焦时长滑杆");
+    }
+  }
+
+  const ratio = (target - panel.min) / Math.max(1, panel.max - panel.min);
+  if (panel.handle && panel.track) {
+    const span = Math.max(1, panel.track.width - panel.handle.width);
+    const x = Math.round(panel.track.left + panel.handle.width / 2 + ratio * span);
+    const y = Math.round(panel.handle.top + panel.handle.height / 2);
+    await sendMouseDrag(win, panel.handle, { x, y });
+    notes.push(`拖动滑杆到 ${x}px`);
+  } else if (panel.track) {
+    const x = Math.round(panel.track.left + ratio * panel.track.width);
+    const y = Math.round(panel.track.top + panel.track.height / 2);
+    await sendMouseClick(win, x, y);
+    notes.push(`点击滑轨 ${x}px`);
+  } else {
+    return { ok: false, current: panel.current, detail: notes.concat("未定位到时长滑杆").join("；") };
+  }
+
+  let state = await waitForDoubaoDurationPanel(win, (value) => value.current === target, 1600);
+  let current = state.current;
+  // Slider libraries snap a drag to the nearest step. Nudge the focused thumb
+  // with arrow keys for any remaining whole seconds.
+  for (let attempt = 0; attempt < 24 && current !== null && current !== target; attempt += 1) {
+    const before = current;
+    await sendKeyboard(win, current < target ? "Right" : "Left", undefined, 140);
+    const next = await inspectDoubaoDurationPanel(win);
+    current = next.current;
+    if (current === null || current === before) break;
+  }
+  notes.push(current === target ? "菜单值已确认" : `菜单值为 ${current ?? "未识别"}s`);
+  return { ok: current === target || (current === null && Boolean(panel.track)), current, detail: notes.join("；") };
+}
+
+export async function selectDoubaoDuration(win: BrowserWindow, targetSeconds: number) {
+  const initial = await waitForDoubaoAspectRatioState(win, (state) => Boolean(state.summary), 2500);
+  if (initial.currentDurationSeconds === targetSeconds) {
+    return {
+      before: initial.currentDurationSeconds,
+      after: initial.currentDurationSeconds,
+      attempts: 0,
+      detail: `工具栏已显示 ${targetSeconds}s`
+    };
+  }
+
+  const diagnostics: string[] = [];
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await sendKeyboard(win, "Escape", undefined, 180);
+    const before = await waitForDoubaoAspectRatioState(win, (state) => Boolean(state.summary), 1800);
+    if (before.currentDurationSeconds === targetSeconds) {
+      return {
+        before: initial.currentDurationSeconds,
+        after: before.currentDurationSeconds,
+        attempts: attempt - 1,
+        detail: `工具栏已显示 ${targetSeconds}s`
+      };
+    }
+
+    let trigger: Awaited<ReturnType<typeof clickDoubaoAspectRatioTrigger>> = null;
+    try {
+      trigger = await clickDoubaoAspectRatioTrigger(win);
+    } catch {
+      // Retry from a clean menu state below.
+    }
+    if (!trigger) {
+      diagnostics.push(`第 ${attempt} 次未找到工具栏时长入口（当前 ${before.summary || "未识别"}）`);
+      continue;
+    }
+
+    await sendMouseClick(win, trigger.x, trigger.y);
+    const applied = await applyDoubaoDuration(win, targetSeconds);
+    if (!applied.ok) {
+      diagnostics.push(`第 ${attempt} 次入口 ${trigger.debug}：${applied.detail}`);
+      continue;
+    }
+
+    await sendKeyboard(win, "Escape", undefined, 150);
+    const selected = await waitForDoubaoAspectRatioState(
+      win,
+      (state) => state.currentDurationSeconds === targetSeconds
+        || (state.currentDurationSeconds === null && applied.current === targetSeconds),
+      3200
+    );
+    if (selected.currentDurationSeconds === targetSeconds) {
+      return {
+        before: initial.currentDurationSeconds,
+        after: selected.currentDurationSeconds,
+        attempts: attempt,
+        detail: applied.detail
+      };
+    }
+    if (selected.currentDurationSeconds === null && applied.current === targetSeconds) {
+      return {
+        before: initial.currentDurationSeconds,
+        after: targetSeconds,
+        attempts: attempt,
+        detail: `${applied.detail}，工具栏未显示时长`
+      };
+    }
+    diagnostics.push(
+      `第 ${attempt} 次入口 ${trigger.debug}，${applied.detail}，关闭后工具栏为 ${selected.summary || "未识别"}`
+    );
+  }
+
+  const state = await waitForDoubaoAspectRatioState(win, () => false, 600);
+  throw new Error(
+    `豆包时长未确认：要求 ${targetSeconds} 秒，当前为 ${state.currentDurationSeconds ? `${state.currentDurationSeconds} 秒` : "未识别"}`
+      + `；页面 ${win.webContents.getURL()}`
+      + `；可见设置 ${state.summary || "无"}`
       + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
   );
 }
@@ -2098,6 +2707,25 @@ async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
   win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
 }
 
+async function sendMouseDrag(
+  win: BrowserWindow,
+  from: { x: number; y: number },
+  to: { x: number; y: number }
+) {
+  await sendMouseMove(win, from.x, from.y);
+  win.webContents.sendInputEvent({ type: "mouseDown", x: from.x, y: from.y, button: "left", clickCount: 1 });
+  await wait(80);
+  const steps = 12;
+  for (let step = 1; step <= steps; step += 1) {
+    const x = Math.round(from.x + (to.x - from.x) * step / steps);
+    const y = Math.round(from.y + (to.y - from.y) * step / steps);
+    win.webContents.sendInputEvent({ type: "mouseMove", x, y, button: "left" });
+    await wait(30);
+  }
+  win.webContents.sendInputEvent({ type: "mouseUp", x: to.x, y: to.y, button: "left", clickCount: 1 });
+  await wait(300);
+}
+
 async function sendMouseMove(win: BrowserWindow, x: number, y: number) {
   win.webContents.sendInputEvent({ type: "mouseMove", x, y });
   await wait(80);
@@ -2220,8 +2848,8 @@ export async function waitForSubmissionStarted(
           )
         );
         const confirmationCount = Math.max(0,
-          (pageText.match(/^\\s*确认生成\\s*$/gm) || []).length
-          - (baselineText.match(/^\\s*确认生成\\s*$/gm) || []).length
+          (pageText.match(/^\\s*确认生成(?:。.*)?\\s*$/gm) || []).length
+          - (baselineText.match(/^\\s*确认生成(?:。.*)?\\s*$/gm) || []).length
         );
         const promptMessageAdded = hasNewPromptOccurrence(pageText, baselineText, prompt);
         const sentEvidence = !newFailureMessage && hasStrongSubmissionEvidence({
@@ -3757,9 +4385,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
 }
 
-function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "prompt">) {
+function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "durationSeconds" | "prompt">) {
   const model = request.model === "seedance_2_0_mini" ? "mini" : "fast";
-  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${extractPromptDuration(request.prompt) || "未指定"}`;
+  const duration = request.durationSeconds ? `${request.durationSeconds}秒` : extractPromptDuration(request.prompt) || "未指定";
+  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${duration}`;
 }
 
 function extractPromptDuration(prompt: string) {
@@ -3779,7 +4408,9 @@ function extractPromptDuration(prompt: string) {
 function operationAction(message: string, status?: ApiRequestStatus) {
   if (status === "success") return "任务完成";
   if (status === "failed") return "任务失败";
-  if (message.includes("上传参考图")) return "上传参考图";
+  if (/上传参考图|参考图已全部上传|参考图上传校验失败|参考图上传失败|参考图不存在|参考图为空/.test(message)) {
+    return "上传参考图";
+  }
   if (message.includes("填写提示词")) return "填写提示词";
   if (message.includes("切换豆包视频生成模式")) return "切换视频生成模式";
   if (message.includes("提交豆包")) return "提交视频任务";

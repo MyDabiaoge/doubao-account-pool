@@ -88,6 +88,14 @@ const settingsDirty = computed(() => Boolean(savedSettings.value && Object.keys(
   settingsForm[key as keyof AppSettings] !== savedSettings.value?.[key as keyof AppSettings]
 )));
 const selectedError = computed(() => selectedRequest.value ? getRequestError(selectedRequest.value) : null);
+const selectedReferenceImages = computed(() => {
+  const request = selectedRequest.value;
+  if (!request) return [];
+  if (Array.isArray(request.referenceImagePaths) && request.referenceImagePaths.length) {
+    return request.referenceImagePaths;
+  }
+  return request.referenceImagePath ? [request.referenceImagePath] : [];
+});
 const selectedActions = computed(() => operationLogs.value.filter((item) => item.requestId === selectedRequest.value?.requestId).slice(0, 18).reverse());
 const watermarkTone = computed(() => {
   if (watermarkStatus.value.error || watermarkStatus.value.usage?.remainingCount === 0) return "warning";
@@ -223,11 +231,13 @@ const apiExample = computed(() => {
   const port = settingsForm.apiPort || 17888;
   const token = "<api-key>";
   return `# 共享额度：账号每日 ${settingsForm.dailyQuotaLimit}，Mini 每次扣 ${settingsForm.miniCost}，Fast 每次扣 ${settingsForm.fastCost}
+# 参考图最多 10 张：可重复 referenceImage，也可用 referenceImages / referenceImageUrls 数组
 curl -X POST http://127.0.0.1:${port}/api/generate \\
   -H "Authorization: Bearer ${token}" \\
   -F "model=seedance_2_0_mini" \\
   -F "prompt=生成一段 10 秒女性科普动画" \\
-  -F "referenceImage=@/Users/your-name/Pictures/ref.png" \\
+  -F "referenceImage=@/Users/your-name/Pictures/ref-1.png" \\
+  -F "referenceImage=@/Users/your-name/Pictures/ref-2.png" \\
   -F "removeWatermark=true" \\
   -F "callbackUrl=http://127.0.0.1:3000/doubao/callback"`;
 });
@@ -511,6 +521,10 @@ function requestAccountLabel(item: ApiRequest) {
   const suffix = item.accountPartition?.match(/doubao_account_(\d+)$/)?.[1];
   if (suffix) return `账号 ${suffix}`;
   return item.accountName || item.accountPartition || "等待分配";
+}
+
+function requestVideoSettingsLabel(item: ApiRequest) {
+  return item.durationSeconds ? `${item.aspectRatio} · ${item.durationSeconds}s` : item.aspectRatio;
 }
 
 function openRequestDetails(item: ApiRequest) {
@@ -1012,7 +1026,7 @@ onBeforeUnmount(() => {
               </td>
               <td>
                 <strong class="model-name">{{ modelLabels[item.model] }}</strong>
-                <span class="cell-meta">{{ requestAccountLabel(item) }} · {{ item.aspectRatio }}</span>
+                <span class="cell-meta">{{ requestAccountLabel(item) }} · {{ requestVideoSettingsLabel(item) }}</span>
               </td>
               <td>
                 <span class="pill" :class="`request-${item.status}`">
@@ -1148,6 +1162,10 @@ onBeforeUnmount(() => {
             <dd>{{ modelLabels[selectedRequest.model] }}</dd>
           </div>
           <div>
+            <dt>时长</dt>
+            <dd>{{ selectedRequest.durationSeconds ? `${selectedRequest.durationSeconds} 秒` : "未指定（沿用豆包当前设置）" }}</dd>
+          </div>
+          <div>
             <dt>账号</dt>
             <dd>{{ requestAccountLabel(selectedRequest) }}</dd>
           </div>
@@ -1156,8 +1174,13 @@ onBeforeUnmount(() => {
             <dd>{{ formatTime(selectedRequest.createdAt) }}</dd>
           </div>
           <div>
-            <dt>参考图</dt>
-            <dd class="detail-path">{{ selectedRequest.referenceImagePath || "未提供" }}</dd>
+            <dt>参考图<span v-if="selectedReferenceImages.length">（{{ selectedReferenceImages.length }} 张）</span></dt>
+            <dd>
+              <ol v-if="selectedReferenceImages.length" class="reference-image-list" aria-label="参考图列表">
+                <li v-for="(imagePath, index) in selectedReferenceImages" :key="`${index}-${imagePath}`">{{ imagePath }}</li>
+              </ol>
+              <span v-else class="detail-path">未提供</span>
+            </dd>
           </div>
         </dl>
 

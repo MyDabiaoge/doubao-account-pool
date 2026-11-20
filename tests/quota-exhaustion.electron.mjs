@@ -21,7 +21,8 @@ app.whenReady().then(async () => {
     const db = new AppDatabase(clock), a = db.createAccount(), b = db.createAccount()
     db.updateAccount({ id: a.id, loginStatus: 'logged_in', currentStatus: 'idle' })
     const reserve = (key, pinned = false) => db.acceptApiRequest({ requestId: key, model: 'seedance_2_0_mini', prompt: 'original fixture prompt',
-      aspectRatio: '9:16', referenceImagePath: '/fixture/reference.png', callbackUrl: 'http://127.0.0.1/fixture-callback' }, pinned ? a.id : undefined)
+      aspectRatio: '9:16', referenceImagePath: '/fixture/reference.png', referenceImagePaths: ['/fixture/reference.png', '/fixture/reference-2.png'],
+      callbackUrl: 'http://127.0.0.1/fixture-callback' }, pinned ? a.id : undefined)
     const enableB = () => db.updateAccount({ id: b.id, loginStatus: 'logged_in', currentStatus: 'idle' })
     const sent = key => db.updateApiRequest({ requestId: key, assignmentRevision: 0, status: 'running', executionPhase: 'submitting', submissionSentAt: time.toISOString() })
     try { run({ db, a, b, reserve, enableB, sent, profile, clock, setDate: value => { time = new Date(value) } }); results.push({ name, ok: true }) }
@@ -56,6 +57,8 @@ app.whenReady().then(async () => {
     const next = changed.find(task => task.requestId === 'one')
     assert.equal(next.status, 'accepted'); assert.equal(next.accountId, b.id); assert.equal(next.assignmentRevision, 1)
     for (const key of ['requestId', 'prompt', 'model', 'aspectRatio', 'referenceImagePath', 'callbackUrl']) assert.equal(next[key], original[key])
+    assert.deepEqual(next.referenceImagePaths, ['/fixture/reference.png', '/fixture/reference-2.png'])
+    assert.deepEqual(next.referenceImagePaths, original.referenceImagePaths)
     assert.equal(next.submissionSentAt, null); assert.equal(next.sourceConversationUrl, null)
     assert.equal(db.getAccount(a.id).quotaRemaining, 10); assert.equal(db.getAccount(b.id).quotaRemaining, 8)
     assert.equal(next.quotaRefunded, false); assert.equal(next.quotaReserved, true)
@@ -206,5 +209,6 @@ app.whenReady().then(async () => {
   } catch (error) { results.push({ name: 'real DOM quota refusal retries same ID through executor scheduler and ordered HTTP callbacks', ok: false, error: error.stack }) }
   finally { windows.forEach(win => { if (!win.isDestroyed()) win.destroy() }); await new Promise(resolve => server.close(resolve)); db.close() }
   console.log('EXHAUSTION_RESULTS ' + JSON.stringify(results))
-  fs.rmSync(root, { recursive: true, force: true }); app.exit(results.every(item => item.ok) ? 0 : 1)
+  try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) } catch { /* Chromium may still hold profile files until the process exits. */ }
+  app.exit(results.every(item => item.ok) ? 0 : 1)
 }).catch(error => { console.error(error); app.exit(1) })

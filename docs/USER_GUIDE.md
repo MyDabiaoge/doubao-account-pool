@@ -155,7 +155,7 @@ curl http://127.0.0.1:17888/health
 | --- | --- |
 | 视频提示词 | `prompt` |
 | 模型选择 | `model` |
-| 参考图片 | `referenceImage` 或 `referenceImageUrl` |
+| 参考图片 | `referenceImage`（可重复）、`referenceImages` 或 `referenceImageUrls` |
 | 画布任务来源 | `source` |
 | 画布回调接口 | `callbackUrl` |
 | 返回的任务编号 | 保存为 `requestId` |
@@ -178,6 +178,7 @@ curl -X POST http://127.0.0.1:17888/api/generate \
   -d '{
     "model": "seedance_2_0_mini",
     "aspectRatio": "16:9",
+    "durationSeconds": 10,
     "prompt": "生成一段10秒、16:9横屏的女性科普动画，不要字幕，不要水印。",
     "source": "infinite-canvas"
   }'
@@ -188,27 +189,43 @@ curl -X POST http://127.0.0.1:17888/api/generate \
 - `seedance_2_0_mini`
 - `seedance_2_0_fast`
 
-当前接口支持独立的 `aspectRatio` 字段，账号池会在豆包窗口中选择并校验 `9:16` 或 `16:9`。时长仍建议写入提示词，最终结果以豆包实际生成状态和 MP4 文件为准。
+接口支持独立的 `aspectRatio` 字段，账号池会在豆包窗口中选择并校验 `9:16` 或 `16:9`。`durationSeconds` 支持 4–15 的整数秒（`duration` 为等价别名）；程序会在发送前打开豆包时长设置，设置并复核目标时长。省略时沿用豆包当前时长，不改写提示词。最终结果仍以豆包实际生成状态和 MP4 文件为准。
 
-## 9. 提交参考图
+## 9. 提交参考图（最多 10 张）
 
-推荐直接上传图片文件：
+推荐直接上传图片文件，重复 `referenceImage` 即可一次传多张：
 
 ```bash
 curl -X POST http://127.0.0.1:17888/api/generate \
   -H "Authorization: Bearer local-doubao-key" \
   -F "model=seedance_2_0_mini" \
   -F "prompt=参考图中的人物和产品，生成10秒、16:9横屏动画。" \
-  -F "referenceImage=@/Users/你的名字/Pictures/reference.png" \
+  -F "referenceImage=@/Users/你的名字/Pictures/ref-1.png" \
+  -F "referenceImage=@/Users/你的名字/Pictures/ref-2.png" \
+  -F "referenceImagePath=/Users/你的名字/Pictures/ref-3.png" \
+  -F "referenceImageUrl=https://example.com/ref-4.png" \
   -F "source=infinite-canvas"
 ```
 
-也可以使用：
+JSON 提交使用数组：
 
-- `referenceImagePath`：账号池所在电脑能够访问的绝对路径。
-- `referenceImageUrl`：账号池能够直接下载的图片 URL。
+```json
+{
+  "model": "seedance_2_0_mini",
+  "prompt": "参考图中的人物和产品，生成10秒动画",
+  "referenceImages": ["/Users/你的名字/Pictures/ref-1.png", "/Users/你的名字/Pictures/ref-2.png"],
+  "referenceImageUrls": ["https://example.com/ref-3.png"]
+}
+```
 
-画布在云端时不能把云端自己的本地路径传给 Mac；应上传文件本身，或提供 Mac 可以访问的 URL。
+规则：
+
+- 最多 10 张；合并顺序为上传文件 → 本机路径 → URL，按绝对路径/URL 去重后计算数量。
+- 旧的单图字段 `referenceImagePath` / `referenceImageUrl` 仍可用，等价于数组里只有一张。
+- 超过 10 张、文件不存在、格式不支持或 URL 下载失败会在创建任务前返回错误，不预扣额度。
+- 单张图片最大 20 MiB，整个请求体最大 100 MiB。
+
+画布在云端时不能把云端自己的本地路径传给账号池所在电脑；应上传文件本身，或提供账号池所在电脑可以访问的 URL。上传的参考图只保存在本机运行目录。
 
 ## 10. 画布必须保存 requestId
 
@@ -278,9 +295,9 @@ curl http://127.0.0.1:17888/api/requests/doubao-1234567890abcdef \
 1. 客户端读取本项目的 `docs/API.md`，调用 `/api/generate`，并把 `requestId` 写入画布任务。
 2. 客户端按 `requestId` 查询状态或接收回调，显示接口返回的 `message`，这样豆包的违规、确认、超时和去水印错误会直接回传，不需要逐个打开豆包窗口排查。
 3. 只有 `success` 且有 MP4 结果时才创建或更新画布视频节点；失败任务保留错误信息，不要把分享页链接当视频。
-4. 参考图使用 multipart 文件上传、可访问的绝对路径或 URL；不要复制登录信息、Cookie 或本地数据库到画布项目或 Git。
+4. 参考图一次最多 10 张，使用 multipart 文件上传、可访问的绝对路径或 URL；不要复制登录信息、Cookie 或本地数据库到画布项目或 Git。
 
-推荐的画布任务字段：`requestId`、`source`、`model`、`aspectRatio`、`prompt`、`status`、`message`、`cleanVideoUrl`、`outputVideoPath`。即使任务提示词或名称相同，也始终以 `requestId` 区分。
+推荐的画布任务字段：`requestId`、`source`、`model`、`aspectRatio`、`durationSeconds`、`prompt`、`status`、`message`、`cleanVideoUrl`、`outputVideoPath`。即使任务提示词或名称相同，也始终以 `requestId` 区分。
 
 ## 14. 什么时候使用“恢复结果”
 
@@ -313,7 +330,8 @@ curl -X POST \
 “行动日志”用于定位程序实际执行到了哪一步，例如：
 
 - 是否分配了账号。
-- 是否上传参考图。
+- 是否上传参考图；多图任务会显示“参考图已全部上传：N/N 张”，以及豆包页面是单次多选还是逐张添加。
+- 参考图上传校验失败时，错误信息会带上检测到的附件数、`multiple/accept` 和页面元素样例，用于判断是页面改版还是图片本身有问题。
 - 是否成功提交豆包。
 - 是否识别到视频生成完成。
 - 是否打开分享面板并复制地址。
@@ -335,6 +353,13 @@ curl -X POST \
 
 检查是否有账号已登录并且共享额度足够。Mini 至少需要 2 点，Fast 至少需要 3 点。指定 `accountId` 时只检查该账号，不自动改用其他账号。
 
+### 多张参考图提交失败
+
+- 400：检查合并去重后的数量是否超过 10 张、路径字段是否误传了 URL、文件是否存在且非空、数组元素是否都是字符串。
+- 413：单张图片超过 20 MiB，或整个请求体超过 100 MiB。
+- 422：URL 不是 http/https、下载超时或返回非 2xx。失败请求不会创建任务，也不会预扣额度。
+- 日志出现“参考图上传校验失败”时，豆包页面的附件数没有达到要求。错误详情会带上检测到的附件数、`multiple/accept` 和页面元素样例。不要绕过校验；把诊断信息保留后重试，页面改版时需要按真实 DOM 校准选择器。
+
 ### 一直显示 accepted
 
 通常是“后台自动执行接口请求”没有开启、并发名额已满、跨天预扣余额不足，或重启后任务已暂停。查看消息和行动日志区分；暂停的已提交任务使用“恢复结果”，不要重新生成。
@@ -354,6 +379,10 @@ curl -X POST \
 ### 输出比例不符合 16:9
 
 接口支持 `aspectRatio: "16:9"` 或 `"9:16"`，默认 `16:9`；程序保存到任务，并在发送前设置和复核豆包工具栏。检查传入参数、提示词和参考图是否冲突；工具栏无法确认目标比例时不会继续生成。
+
+### 输出时长不对或任务提示“豆包时长未确认”
+
+传入 `durationSeconds`（或 `duration`）时，必须是 4–15 的整数秒；其他值会在创建任务前返回 `400 invalid_duration`。程序会打开豆包工具栏的时长设置并复核，无法确认目标时长时在发送前失败并退回预扣，不会静默使用豆包当前时长。不传该字段则不会主动修改时长；提示词里写的“10 秒”不会替代工具栏设置。
 
 ### 同样提示词的任务会不会串
 

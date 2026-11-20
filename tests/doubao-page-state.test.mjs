@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   containsPromptSignature,
   doubaoAspectRatioFromText,
+  doubaoDurationFromText,
   isDoubaoAspectRatioTriggerText,
   doubaoVideoModelFromText,
   doubaoVideoModelLabel,
@@ -251,6 +252,15 @@ test('recognizes an explicit Doubao aspect ratio without guessing when both are 
   assert.equal(isDoubaoAspectRatioTriggerText('比例 16:9 · 10 秒'), true)
   assert.equal(isDoubaoAspectRatioTriggerText('提示词要求画面比例 16:9，人物居中'), false)
   assert.equal(isDoubaoAspectRatioTriggerText('视频生成'), false)
+})
+
+test('reads the duration shown by the collapsed video toolbar', () => {
+  assert.equal(doubaoDurationFromText('自动 · 10s'), 10)
+  assert.equal(doubaoDurationFromText('9:16 · 5s'), 5)
+  assert.equal(doubaoDurationFromText('16:9 · 10 秒'), 10)
+  assert.equal(doubaoDurationFromText('比例 16:9'), null)
+  assert.equal(doubaoDurationFromText('Seedance 2.0 Mini'), null)
+  assert.equal(doubaoDurationFromText(''), null)
 })
 
 test('accepts only new HTTP video links for the current generation', () => {

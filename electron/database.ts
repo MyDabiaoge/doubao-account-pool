@@ -5,7 +5,13 @@ import { diagnoseRequest } from "./request-diagnostics.js";
 import { nextQuotaReset, quotaDate } from "./quota-clock.js";
 import { quotaAmount } from "./quota-amount.js";
 import { doubaoDailyQuotaError, isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
+import { normalizeDoubaoDurationSeconds } from "./generation-options.js";
 import { mergeWatermarkStatus, watermarkScope, type WatermarkProviderEvent } from "./watermark-state.js";
+import {
+  firstStringFromStoredPaths,
+  parseStoredReferenceImagePaths,
+  referenceImagesForStorage
+} from "./reference-images.js";
 import type {
   Account,
   AccountCreateInput,
@@ -107,11 +113,13 @@ export class AppDatabase {
         source TEXT NOT NULL DEFAULT 'local',
         model TEXT NOT NULL,
         aspect_ratio TEXT NOT NULL DEFAULT '16:9',
+        duration_seconds INTEGER,
         account_id INTEGER,
         status TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
         prompt TEXT NOT NULL,
         reference_image_path TEXT,
+        reference_image_paths TEXT,
         remove_watermark INTEGER NOT NULL DEFAULT 1,
         callback_url TEXT,
         doubao_thread_url TEXT,
@@ -144,6 +152,7 @@ export class AppDatabase {
 
     this.ensureAccountColumns();
     this.ensureApiRequestColumns();
+    this.backfillReferenceImagePaths();
     this.pruneOperationLogs();
     this.cleanInvalidSuccessfulResults();
     this.ensureDefaultSettings();
@@ -588,6 +597,7 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS durationSeconds,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -599,6 +609,7 @@ export class AppDatabase {
         api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -646,6 +657,7 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS durationSeconds,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -657,6 +669,7 @@ export class AppDatabase {
         api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
+        api_requests.reference_image_paths AS referenceImagePathsJson,
         api_requests.remove_watermark AS removeWatermark,
         api_requests.callback_url AS callbackUrl,
         api_requests.doubao_thread_url AS doubaoThreadUrl,
@@ -682,18 +695,24 @@ export class AppDatabase {
 
   createApiRequest(input: ApiRequestCreateInput): ApiRequest {
     const timestamp = now();
+    const referenceImages = referenceImagesForStorage({
+      paths: input.referenceImagePaths,
+      legacyPath: input.referenceImagePath
+    });
     this.db.prepare(`
       INSERT INTO api_requests (
         request_id,
         source,
         model,
         aspect_ratio,
+        duration_seconds,
         account_id,
         requested_account_id,
         status,
         message,
         prompt,
         reference_image_path,
+        reference_image_paths,
         remove_watermark,
         callback_url,
         quota_cost,
@@ -704,18 +723,20 @@ export class AppDatabase {
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
       input.model,
       input.aspectRatio || "16:9",
+      normalizeDoubaoDurationSeconds(input.durationSeconds),
       input.accountId ?? null,
       input.requestedAccountId ?? null,
       input.status,
       input.message || "",
       input.prompt,
-      input.referenceImagePath || null,
+      referenceImages.firstPath,
+      referenceImages.pathsJson,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
       quotaAmount(input.quotaCost || 0),
@@ -1012,7 +1033,9 @@ export class AppDatabase {
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
     this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT NOT NULL DEFAULT '16:9'");
+    this.addColumnIfMissing("api_requests", "duration_seconds", "INTEGER");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "reference_image_paths", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
     this.addColumnIfMissing("api_requests", "doubao_thread_url", "TEXT");
@@ -1031,6 +1054,32 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "requested_account_id", "INTEGER");
     this.addColumnIfMissing("api_requests", "assignment_revision", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("api_requests", "submission_sent_at", "TEXT");
+  }
+
+  private backfillReferenceImagePaths() {
+    const legacyRows = this.db.prepare(`
+      SELECT request_id AS requestId, reference_image_path AS path
+      FROM api_requests
+      WHERE reference_image_path IS NOT NULL
+        AND TRIM(reference_image_path) <> ''
+        AND (reference_image_paths IS NULL OR TRIM(reference_image_paths) = '')
+    `).all() as Array<{ requestId: string; path: string }>;
+    const updatePaths = this.db.prepare("UPDATE api_requests SET reference_image_paths = ? WHERE request_id = ?");
+    for (const row of legacyRows) {
+      updatePaths.run(JSON.stringify([row.path]), row.requestId);
+    }
+
+    const newRows = this.db.prepare(`
+      SELECT request_id AS requestId, reference_image_paths AS paths
+      FROM api_requests
+      WHERE reference_image_paths IS NOT NULL AND TRIM(reference_image_paths) <> ''
+        AND (reference_image_path IS NULL OR TRIM(reference_image_path) = '')
+    `).all() as Array<{ requestId: string; paths: string }>;
+    const updateMirror = this.db.prepare("UPDATE api_requests SET reference_image_path = ? WHERE request_id = ?");
+    for (const row of newRows) {
+      const first = firstStringFromStoredPaths(row.paths);
+      if (first) updateMirror.run(first, row.requestId);
+    }
   }
 
   private cleanInvalidSuccessfulResults() {
@@ -1105,16 +1154,21 @@ function normalizeApiRequest(row: unknown): ApiRequest {
     removeWatermark: number | boolean;
     quotaRefunded: number | boolean;
     errorJson: string | null;
+    referenceImagePathsJson: string | null;
   };
   let error = null;
   if (request.status === "failed") {
     try { error = request.errorJson ? JSON.parse(request.errorJson) : diagnoseRequest(request.message); }
     catch { error = diagnoseRequest(request.message); }
   }
-  const { errorJson: _errorJson, ...values } = request;
+  const referenceImagePaths = parseStoredReferenceImagePaths(request.referenceImagePathsJson, request.referenceImagePath);
+  const { errorJson: _errorJson, referenceImagePathsJson: _referenceImagePathsJson, ...values } = request;
   return {
     ...values,
+    referenceImagePath: referenceImagePaths[0] ?? null,
+    referenceImagePaths,
     aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
+    durationSeconds: normalizeDoubaoDurationSeconds(request.durationSeconds),
     removeWatermark: Boolean(request.removeWatermark),
     quotaRefunded: Boolean(request.quotaRefunded),
     quotaReserved: Boolean(request.quotaReserved),

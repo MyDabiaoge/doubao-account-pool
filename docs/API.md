@@ -3,7 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
-- 当前接口版本：`0.1.76`
+- 当前接口版本：`0.1.79`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。
@@ -35,13 +35,14 @@ Authorization: Bearer <api-key>
 Content-Type: multipart/form-data
 ```
 
-也可以使用 JSON 提交；`aspectRatio` 会保存到任务记录，并在豆包窗口发送前设置和校验。
+也可以使用 JSON 提交；`aspectRatio` 和 `durationSeconds` 会保存到任务记录，并在豆包窗口发送前设置和校验。
 
 ```json
 {
   "model": "seedance_2_0_mini",
   "aspectRatio": "9:16",
-  "prompt": "生成一段 5 秒视频"
+  "durationSeconds": 10,
+  "prompt": "生成一段 10 秒视频"
 }
 ```
 
@@ -53,19 +54,69 @@ Content-Type: multipart/form-data
 | `model` | 否 | `seedance_2_0_mini` 或 `seedance_2_0_fast` |
 | `accountId` | 否 | 正整数账号 ID；省略则自动调度；指定账号不可用或余额不足时返回 409，不会偷偷换用其他账号 |
 | `aspectRatio` | 否 | `9:16` 或 `16:9`；省略时默认 `16:9`，保存到任务并在豆包窗口发送前校验 |
-| `referenceImage` | 否 | 上传的参考图片文件 |
-| `referenceImagePath` | 否 | 本机参考图片绝对路径 |
-| `referenceImageUrl` | 否 | 可下载的参考图片 URL |
+| `durationSeconds` | 否 | 视频时长，整数秒，范围 **4–15**；保存到任务并在豆包窗口发送前设置和校验。`duration` 为等价别名，同时传入时以 `durationSeconds` 为准；省略时沿用豆包当前设置，不主动修改 |
+| `referenceImage` | 否 | 上传的参考图片文件；multipart 中可重复出现 |
+| `referenceImages` | 否 | 本机参考图片绝对路径数组 |
+| `referenceImageUrls` | 否 | 可下载的参考图片 URL 数组 |
+| `referenceImagePath` | 否 | 旧单图字段，等价于 `referenceImages` 中只有一个元素 |
+| `referenceImageUrl` | 否 | 旧单图字段，等价于 `referenceImageUrls` 中只有一个元素 |
 | `callbackUrl` | 否 | 状态变化时接收 JSON 的回调地址 |
 | `source` | 否 | 请求来源名称 |
 
-生成请求固定执行最终 MP4 结果验证。去水印失败、平台不支持或没有取得可播放 MP4 时，任务状态为 `failed`。
+`durationSeconds` 不是 4–15 的整数时，接口在创建任务和预扣额度前返回 `400`：
+
+```json
+{ "error": "durationSeconds must be an integer between 4 and 15", "code": "invalid_duration" }
+```
+
+执行器会在设置画幅后打开豆包工具栏的时长设置，按可见的 4–15 秒标注聚焦滑杆并用方向键设置目标时长（必要时回退点击），关闭后按工具栏摘要复核；目标时长无法确认时任务在发送前失败并按原规则退回预扣，不会静默沿用其他时长。公开响应包含实际保存的 `durationSeconds`（未指定时为 `null`），时长不会写入或改写提示词。
+
+参考图最多 **10 张**，多个来源按以下顺序合并：multipart 上传文件 → `referenceImages` / `referenceImagePath` → `referenceImageUrls` / `referenceImageUrl`。本机路径按绝对路径去重（Windows 忽略大小写），URL 按规范化地址去重；合并去重后超过 10 张返回 `400`，不创建任务、不预扣额度。单张图片最大 20 MiB，整个请求体最大 100 MiB。
+
+multipart 多图示例：
+
+```bash
+curl -X POST http://127.0.0.1:17888/api/generate \
+  -H "Authorization: Bearer <api-key>" \
+  -F "model=seedance_2_0_mini" \
+  -F "prompt=参考图中的人物和产品，生成10秒动画" \
+  -F "referenceImage=@/path/ref-1.png" \
+  -F "referenceImage=@/path/ref-2.png" \
+  -F "referenceImagePath=/path/ref-3.png" \
+  -F "referenceImageUrl=https://example.com/ref-4.png"
+```
+
+JSON 多图示例：
+
+```json
+{
+  "model": "seedance_2_0_mini",
+  "prompt": "参考图中的人物和产品，生成10秒动画",
+  "referenceImages": ["C:\\images\\ref-1.png", "/Users/me/ref-2.jpg"],
+  "referenceImageUrls": ["https://example.com/ref-3.png"]
+}
+```
+
+参考图校验失败时，接口在创建任务前返回 `{ "error": "...", "code": "..." }`：
+
+| 情况 | 状态 | code |
+| --- | --- | --- |
+| 合并去重后超过 10 张 | 400 | `too_many_reference_images` |
+| 数组包含非字符串 | 400 | `invalid_reference_image` |
+| 路径字段传入 URL | 400 | `invalid_reference_image_path` |
+| 本机文件不存在、不是文件或为空 | 400 | `reference_image_missing` |
+| 图片格式不受支持 | 400 | `unsupported_reference_image` |
+| 单张图片或请求体超限 | 413 | `reference_image_too_large` / `payload_too_large` |
+| URL 协议不是 http/https | 400 | `invalid_reference_image_url` |
+| URL 下载失败、超时或返回非 2xx | 422 | `reference_image_download_failed` |
+
+生成请求固定执行最终 MP4 结果验证。去水印失败、平台不支持或没有取得可播放 MP4 时，任务状态为 `failed`。公开响应不返回参考图路径；完整的参考图列表可在账号池界面任务详情中查看。
 
 有足够额度但达到并发上限时，请求仍可返回 `accepted` 并预扣额度进入队列。每条任务的准备、发送和受理等待独立进行，不因同账号前一条尚未受理而串行阻塞。若豆包明确限制并发，保留原文并等待已有任务结束，不绕过限制或无限催发。
 
 每天北京时间 00:00 自动切换本地每日账期；启动、唤醒和接收请求时补检查，同一天不重复补额。正式受理的任务保留原账期，未受理的排队任务进入新账期重新预扣；余额不足继续排队，不超扣。升级时未知账期初始化为升级当天并保留当前余额，不擅自补满。此机制不修改豆包服务端额度，也不重置第三方付费去水印次数。
 
-自动分配的任务收到明确的每日次数耗尽拒绝、尚未正式受理时，可在同一个 `requestId` 下换号继续。回调先显示换号排队信息，不会先发 `failed` 再恢复运行；提示词、参考图、模型、画幅和回调地址不变，调用方无需重新提交。已发送但结果未明的任务不会因另一条任务的拒绝而换号；已正式受理的任务继续在原对话取结果。无其他可用账号或任务明确指定 `accountId` 时，直接失败并只退回尚持有的预扣。
+自动分配的任务收到明确的每日次数耗尽拒绝、尚未正式受理时，可在同一个 `requestId` 下换号继续。回调先显示换号排队信息，不会先发 `failed` 再恢复运行；提示词、全部参考图路径、模型、画幅和回调地址不变，调用方无需重新提交。已发送但结果未明的任务不会因另一条任务的拒绝而换号；已正式受理的任务继续在原对话取结果。无其他可用账号或任务明确指定 `accountId` 时，直接失败并只退回尚持有的预扣。
 
 这类失败统一返回下列结构，不能与去水印服务的 `watermark / quota_exhausted` 混淆：
 
