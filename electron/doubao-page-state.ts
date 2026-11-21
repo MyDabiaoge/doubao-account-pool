@@ -322,6 +322,8 @@ export function extractDoubaoFailureMessage(pageText: string) {
     /免费(?:视频)?(?:生成)?次数(?:已经|已)?(?:用完|耗尽)[^。！？]*(?:[。！？]|$)/,
     /生成额度未扣除[^。！？]*(?:[。！？]|$)/,
     /额度未扣除[^。！？]*(?:[。！？]|$)/,
+    /生成的[^。！？]*版权限制[^。！？]*(?:[。！？]|$)/,
+    /版权限制[^。！？]*(?:[。！？]|$)/,
     /视频生成失败[^。！？]*(?:[。！？]|$)/,
     /生成视频失败[^。！？]*(?:[。！？]|$)/,
     /未能生成视频[^。！？]*(?:[。！？]|$)/
@@ -510,4 +512,13 @@ export function hasNewPromptOccurrence(currentText: string, baselineText: string
 
 export function isQuotaNotChargedFailure(message: string) {
   return /额度未扣除|生成额度未扣除|未消耗|未扣费|不会扣除/.test(message);
+}
+
+/**
+ * Doubao can reject a copyright-restricted request after accepting it without
+ * charging its own quota; such replies never lead to a video, so the task must
+ * fail fast and the locally reserved quota must be refunded.
+ */
+export function isRefundablePageFailure(message: string) {
+  return isQuotaNotChargedFailure(message) || /版权限制/.test(message);
 }

@@ -31,6 +31,7 @@ import {
   isGenerationReadyForShare,
   isFormalDoubaoConversationUrl,
   isQuotaNotChargedFailure,
+  isRefundablePageFailure,
   promptSignature,
 } from '../dist-electron/doubao-page-state.js'
 
@@ -45,6 +46,16 @@ test('detects Doubao infringement and violation failures', () => {
 test('detects common generation failure text', () => {
   assert.equal(extractDoubaoFailureMessage('视频生成失败，请稍后再试。'), '视频生成失败，请稍后再试。')
   assert.equal(extractDoubaoFailureMessage('你的视频免费额度还有 2 次。'), null)
+})
+
+test('detects copyright restriction replies as refundable failures', () => {
+  const text = '生成的视频可能涉及版权限制，请更换输入内容后重试'
+
+  assert.equal(extractDoubaoFailureMessage(text), text)
+  assert.equal(extractDoubaoFailureMessage(`历史回复 ${text}`), text)
+  assert.equal(isDoubaoGenerationPending(text), false)
+  assert.equal(isRefundablePageFailure(text), true)
+  assert.equal(isRefundablePageFailure('今日视频生成免费次数已用完'), false)
 })
 
 test('keeps submitted or generating videos pending without hiding failures', () => {

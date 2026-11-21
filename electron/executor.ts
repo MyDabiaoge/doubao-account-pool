@@ -32,7 +32,7 @@ import {
   isDoubaoSafetyConfirmationDialog,
   isGenerationReadyForShare,
   isFormalDoubaoConversationUrl,
-  isQuotaNotChargedFailure,
+  isRefundablePageFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
@@ -106,7 +106,7 @@ const SHARE_PANEL_WAIT_MS = 3500;
 const PAGE_SHARE_CAPTURE_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
-const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成。申明：版权风险由个人承担！";
+const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成";
 const PREFERRED_CONVERSATION_RETRY_MS = 75000;
 const RECENT_CONVERSATION_FALLBACK_LIMIT = 10;
 const callbackQueues = new Map<string, Promise<void>>();
@@ -266,7 +266,7 @@ export class DoubaoExecutor {
       }
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
-          const shouldRefund = isQuotaNotChargedFailure(recovery.failureMessage)
+          const shouldRefund = isRefundablePageFailure(recovery.failureMessage)
             && !request.message.includes("已退回预扣额度");
           if (shouldRefund) this.database.refundApiRequestQuota(requestId, request.assignmentRevision);
           await this.failRequest(
@@ -2347,7 +2347,7 @@ export async function submitPromptAndWait(
       if (isDoubaoConcurrencyLimitReply(result.failureMessage)) throw new DoubaoConcurrencyLimitError(result.failureMessage);
       throw new DoubaoPageFailureError(
         `豆包提交后返回失败：${result.failureMessage}`,
-        isQuotaNotChargedFailure(result.failureMessage)
+        isRefundablePageFailure(result.failureMessage)
       );
     }
     if (result.confirmationClicked) {
@@ -2395,7 +2395,7 @@ async function awaitGenerationStart(
       return "confirmed";
     }
     if (isDoubaoConcurrencyLimitReply(state.failureMessage || state.responseMessage)) throw new DoubaoConcurrencyLimitError(state.failureMessage || state.responseMessage || "豆包并发受限");
-    if (state.failureMessage) throw new DoubaoPageFailureError(`豆包返回失败：${state.failureMessage}`, isQuotaNotChargedFailure(state.failureMessage));
+    if (state.failureMessage) throw new DoubaoPageFailureError(`豆包返回失败：${state.failureMessage}`, isRefundablePageFailure(state.failureMessage));
     if (isDoubaoCongestionReply(state.responseMessage)) throw new DoubaoCongestionError(state.responseMessage || "豆包繁忙");
     const now = Date.now();
     const reply = state.responseMessage || "";
@@ -2981,7 +2981,7 @@ async function waitForGenerationResult(
     } else if (newFailureMessage) {
       throw new DoubaoPageFailureError(
         `豆包已返回视频生成失败：${newFailureMessage}`,
-        isQuotaNotChargedFailure(newFailureMessage)
+        isRefundablePageFailure(newFailureMessage)
       );
     }
 
@@ -3115,7 +3115,7 @@ async function waitForGenerationResult(
     }
     throw new DoubaoPageFailureError(
       `豆包已返回视频生成失败：${recovery.failureMessage}`,
-      isQuotaNotChargedFailure(recovery.failureMessage)
+      isRefundablePageFailure(recovery.failureMessage)
     );
   }
   if (recovery.pendingMatchCount > 0) {
