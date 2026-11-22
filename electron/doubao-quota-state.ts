@@ -3,8 +3,8 @@ import type { RequestErrorInfo } from "./types.js";
 export function isDoubaoDailyQuotaExhausted(value: string | null | undefined): boolean {
   const text = (value || "").replace(/[\s*]+/g, "");
   if (/去水印|解析次数|侵权|违规/.test(text)) return false;
-  return /(?:今日|今天)(?:的)?(?:视频)?(?:生成)?(?:免费)?(?:生成)?次数(?:已经|已)?(?:用完|耗尽)/.test(text)
-    || /免费(?:视频)?(?:生成)?次数(?:已经|已)?(?:用完|耗尽).{0,24}明天/.test(text);
+  return /(?:今日|今天)(?:的)?(?:视频)?(?:生成)?(?:免费)?(?:生成)?(?:次数|额度)(?:已经|已)?(?:用完|耗尽|使完)/.test(text)
+    || /免费(?:视频)?(?:生成)?(?:次数|额度)(?:已经|已)?(?:用完|耗尽|使完).{0,24}明天/.test(text);
 }
 
 export function doubaoDailyQuotaError(detail: string): RequestErrorInfo {

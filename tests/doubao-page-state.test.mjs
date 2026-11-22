@@ -226,6 +226,10 @@ test('detects the exhausted daily free generation quota message', () => {
   assert.equal(extractDoubaoFailureMessage('今日免费生成次数已用完，明天再来吧。'), '今日免费生成次数已用完，明天再来吧。')
   assert.equal(extractDoubaoFailureMessage('今日生成次数已用完。'), '今日生成次数已用完。')
   assert.equal(extractDoubaoFailureMessage('免费生成次数已用完，请明天再试。'), '免费生成次数已用完，请明天再试。')
+  assert.equal(
+    extractDoubaoFailureMessage('今日视频生成免费额度已用完。开通订阅畅享更多额度。'),
+    '今日视频生成免费额度已用完。'
+  )
   assert.equal(isQuotaNotChargedFailure('今日视频生成免费次数已用完'), false)
 })
 
