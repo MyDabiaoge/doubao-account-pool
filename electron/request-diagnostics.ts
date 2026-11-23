@@ -53,6 +53,7 @@ export function diagnoseRequest(message: string): RequestErrorInfo {
   }
   if (/没有可用账号|请求没有分配账号|账号不存在/.test(message)) return requestError("account", "account_unavailable", "暂无可用账号", message, "检查空闲账号、登录状态和豆包本地额度。");
   if (/未登录|登录失效|需要登录/.test(message)) return requestError("account", "login_required", "豆包账号需要登录", message, "打开对应账号重新登录。");
+  if (/版权限制/.test(message)) return requestError("generation", "copyright_restricted", "豆包提示版权限制", message, "按豆包提示更换输入内容后重新提交；本次预扣额度已退回。");
   if (/侵权|违规|无法返回该内容|换个主题/.test(message)) return requestError("generation", "content_rejected", "豆包拒绝生成内容", message, "按豆包回复调整内容后再提交。");
   if (/没有确认|未确认|提示词建议|未启动|提交确认/.test(message)) return requestError("submission", "not_started", "尚未确认视频任务启动", message, "检查当前对话的确认状态，避免重复提交原提示词。");
   if (/超时/.test(message)) return requestError("generation", "generation_timeout", "等待视频结果超时", message, "先检查原对话并恢复已有结果。", true);

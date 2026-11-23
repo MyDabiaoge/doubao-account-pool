@@ -29,6 +29,15 @@ test('classifies unconfirmed video settings as a submission-stage failure', () =
   assert.equal(requestPhase({ status: 'running', message: '正在设置豆包时长：10s', error: null }), '准备生成')
 })
 
+test('classifies copyright restriction replies into their own category', () => {
+  const error = diagnoseRequest('豆包已返回视频生成失败：生成的视频可能涉及版权限制，请更换输入内容后重试')
+  assert.equal(error.stage, 'generation')
+  assert.equal(error.code, 'copyright_restricted')
+  assert.equal(error.title, '豆包提示版权限制')
+  assert.equal(error.retryable, false)
+  assert.equal(requestPhase({ status: 'failed', message: error.detail, error }), error.title)
+})
+
 test('shows a precise account-level failure without hiding the original reply', () => {
   const error = diagnoseRequest(`豆包返回失败：${actualReply}，已退回预扣额度`)
   assert.equal(error.stage, 'account')

@@ -50,7 +50,7 @@ const batchMenuOpen = ref(false);
 const apiAddressCopied = ref(false);
 const logSearch = ref("");
 const logStatusFilter = ref<"all" | ApiRequestStatus>("all");
-const logFailureFilter = ref<"all" | FailureStage | "quota_exhausted" | "token">("all");
+const logFailureFilter = ref<"all" | FailureStage | "quota_exhausted" | "token" | "copyright_restricted">("all");
 const operationSearch = ref("");
 const operationStatusFilter = ref<"all" | OperationLogStatus>("all");
 const copiedField = ref<"prompt" | "result" | null>(null);
@@ -147,7 +147,8 @@ const filteredApiRequests = computed(() => {
     const error = getRequestError(item);
     if (logFailureFilter.value === "quota_exhausted" && error?.code !== "quota_exhausted") return false;
     if (logFailureFilter.value === "token" && !["token_invalid", "token_disabled", "token_missing", "access_denied"].includes(error?.code || "")) return false;
-    if (!["all", "quota_exhausted", "token"].includes(logFailureFilter.value) && error?.stage !== logFailureFilter.value) return false;
+    if (logFailureFilter.value === "copyright_restricted" && error?.code !== "copyright_restricted") return false;
+    if (!["all", "quota_exhausted", "token", "copyright_restricted"].includes(logFailureFilter.value) && error?.stage !== logFailureFilter.value) return false;
     if (!keyword) return true;
 
     return [
@@ -992,7 +993,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
         <label class="log-failure-filter"><span>问题分类</span><select v-model="logFailureFilter">
-          <option value="all">全部问题</option><option value="quota_exhausted">去水印次数耗尽</option><option value="token">去水印认证问题</option>
+          <option value="all">全部问题</option><option value="quota_exhausted">去水印次数耗尽</option><option value="token">去水印认证问题</option><option value="copyright_restricted">版权限制</option>
           <option value="watermark">所有去水印问题</option><option value="sharing">复制分享</option><option value="submission">生成确认</option><option value="generation">豆包生成</option><option value="account">账号与额度</option><option value="output">文件保存</option>
         </select></label>
         <span class="log-count">显示 {{ filteredApiRequests.length }} / {{ apiRequests.length }} 条</span>
